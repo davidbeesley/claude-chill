@@ -16,6 +16,12 @@ if {$binary eq ""} {
 set env(PS1) "TEST> "
 set prompt "TEST> "
 
+# Ensure TERM is set for proper terminal emulation (needed for less/vim alt screen)
+set env(TERM) "xterm-256color"
+
+# Suppress macOS bash zsh migration warning
+set env(BASH_SILENCE_DEPRECATION_WARNING) "1"
+
 proc fail {msg} {
     puts "\n\033\[31mFAIL: $msg\033\[0m"
     exit 1
