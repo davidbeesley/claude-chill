@@ -234,6 +234,48 @@ if {$vi_cmd eq ""} {
 }
 
 #############################################
+# Test 6: Dumb terminal mode (no alt screen)
+#############################################
+puts "\nTest 6: Dumb terminal mode"
+
+# Temporarily set TERM to dumb
+set env(TERM) "dumb"
+
+spawn $binary -- /bin/bash --norc --noprofile
+expect $prompt
+
+# Generate some output
+send "echo dumb_test\r"
+expect $prompt
+
+# Lookback should work since there's no alt screen
+send "\x1e"
+expect {
+    "LOOKBACK MODE" { }
+    timeout { fail "lookback mode not working in dumb terminal" }
+}
+
+# Exit lookback
+send "\x1e"
+sleep 0.3
+
+# Shell should still work
+send "echo after_dumb_lookback\r"
+expect {
+    "after_dumb_lookback" { }
+    timeout { fail "shell not responsive after lookback in dumb mode" }
+}
+
+send "exit\r"
+expect {
+    eof { pass "Dumb terminal mode" }
+    timeout { fail "did not exit cleanly" }
+}
+
+# Restore TERM for any subsequent tests
+set env(TERM) "xterm-256color"
+
+#############################################
 # Summary
 #############################################
 puts "\n\033\[32m========================================\033\[0m"
