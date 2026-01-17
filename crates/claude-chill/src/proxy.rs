@@ -353,6 +353,7 @@ impl Proxy {
             write_all(stdout_fd, &self.sync_buffer)?;
         }
 
+        self.sync_buffer.clear();
         Ok(())
     }
 
