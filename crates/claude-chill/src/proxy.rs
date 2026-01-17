@@ -6,12 +6,15 @@ use crate::escape_sequences::{
 use crate::line_buffer::LineBuffer;
 use anyhow::{Context, Result};
 use memchr::memmem;
+use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::pty::{Winsize, openpty};
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, sigaction};
 use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
+use nix::unistd::{Pid, isatty, read, write};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -139,9 +142,8 @@ impl Proxy {
     }
 
     pub fn run(&mut self) -> Result<i32> {
-        let stdin_raw = io::stdin().as_raw_fd();
-        let stdout_raw = io::stdout().as_raw_fd();
-        let master_raw = self.pty_master.as_raw_fd();
+        let stdin_fd = io::stdin();
+        let stdout_fd = io::stdout();
 
         let mut buf = [0u8; 65536];
 
@@ -156,62 +158,56 @@ impl Proxy {
                 self.forward_signal(Signal::SIGTERM);
             }
 
+            let master_fd = unsafe { BorrowedFd::borrow_raw(self.pty_master.as_raw_fd()) };
+            let stdin_borrowed = unsafe { BorrowedFd::borrow_raw(stdin_fd.as_raw_fd()) };
+
             let mut poll_fds = [
-                libc::pollfd {
-                    fd: master_raw,
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: stdin_raw,
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
+                PollFd::new(master_fd, PollFlags::POLLIN),
+                PollFd::new(stdin_borrowed, PollFlags::POLLIN),
             ];
 
-            let poll_ret = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, 100) };
-            if poll_ret == 0 {
-                continue;
-            }
-            if poll_ret < 0 {
-                let err = unsafe { *libc::__errno_location() };
-                if err == libc::EINTR {
-                    continue;
-                }
-                anyhow::bail!("poll failed: errno {}", err);
+            match poll(&mut poll_fds, PollTimeout::from(100u16)) {
+                Ok(0) => continue,
+                Ok(_) => {}
+                Err(Errno::EINTR) => continue,
+                Err(e) => anyhow::bail!("poll failed: {}", e),
             }
 
-            if poll_fds[0].revents & libc::POLLIN != 0 {
-                match libc_read(master_raw, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => self.process_output(&buf[..n], stdout_raw)?,
-                    Err(e) if e == libc::EAGAIN => {}
-                    Err(e) if e == libc::EIO => break,
-                    Err(e) => anyhow::bail!("read from pty failed: errno {}", e),
+            if let Some(revents) = poll_fds[0].revents() {
+                if revents.contains(PollFlags::POLLIN) {
+                    match nix_read(&self.pty_master, &mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => self.process_output(&buf[..n], &stdout_fd)?,
+                        Err(Errno::EAGAIN) => {}
+                        Err(Errno::EIO) => break,
+                        Err(e) => anyhow::bail!("read from pty failed: {}", e),
+                    }
+                }
+                if revents.contains(PollFlags::POLLHUP) {
+                    break;
                 }
             }
-            if poll_fds[0].revents & libc::POLLHUP != 0 {
-                break;
-            }
 
-            if poll_fds[1].revents & libc::POLLIN != 0 {
-                match libc_read(stdin_raw, &mut buf) {
+            if let Some(revents) = poll_fds[1].revents()
+                && revents.contains(PollFlags::POLLIN)
+            {
+                match nix_read(&stdin_fd, &mut buf) {
                     Ok(0) => break,
-                    Ok(n) => self.process_input(&buf[..n], stdout_raw)?,
-                    Err(e) if e == libc::EAGAIN => {}
-                    Err(e) => anyhow::bail!("read from stdin failed: errno {}", e),
+                    Ok(n) => self.process_input(&buf[..n], &stdout_fd)?,
+                    Err(Errno::EAGAIN) => {}
+                    Err(e) => anyhow::bail!("read from stdin failed: {}", e),
                 }
             }
         }
 
         if !self.sync_buffer.is_empty() {
-            write_all_raw(stdout_raw, &self.sync_buffer)?;
+            write_all(&stdout_fd, &self.sync_buffer)?;
         }
 
         self.wait_child()
     }
 
-    fn process_output(&mut self, data: &[u8], stdout_fd: i32) -> Result<()> {
+    fn process_output<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
         if self.in_alternate_screen {
             return self.process_output_alt_screen(data, stdout_fd);
         }
@@ -228,15 +224,15 @@ impl Proxy {
                 if self.in_sync_block {
                     self.sync_buffer
                         .extend_from_slice(&data[pos..pos + alt_pos]);
-                    write_all_raw(stdout_fd, &self.sync_buffer)?;
+                    write_all(stdout_fd, &self.sync_buffer)?;
                     self.sync_buffer.clear();
                     self.in_sync_block = false;
                 } else if alt_pos > 0 {
-                    write_all_raw(stdout_fd, &data[pos..pos + alt_pos])?;
+                    write_all(stdout_fd, &data[pos..pos + alt_pos])?;
                 }
                 self.in_alternate_screen = true;
                 let seq_len = self.alt_screen_enter_len(&data[pos + alt_pos..]);
-                write_all_raw(stdout_fd, &data[pos + alt_pos..pos + alt_pos + seq_len])?;
+                write_all(stdout_fd, &data[pos + alt_pos..pos + alt_pos + seq_len])?;
                 return self.process_output_alt_screen(&data[pos + alt_pos + seq_len..], stdout_fd);
             }
 
@@ -253,14 +249,14 @@ impl Proxy {
                 }
             } else if let Some(idx) = self.sync_start_finder.find(&data[pos..]) {
                 if idx > 0 {
-                    write_all_raw(stdout_fd, &data[pos..pos + idx])?;
+                    write_all(stdout_fd, &data[pos..pos + idx])?;
                 }
                 self.in_sync_block = true;
                 self.sync_buffer.clear();
                 self.sync_buffer.extend_from_slice(SYNC_START);
                 pos += idx + SYNC_START.len();
             } else {
-                write_all_raw(stdout_fd, &data[pos..])?;
+                write_all(stdout_fd, &data[pos..])?;
                 break;
             }
         }
@@ -268,15 +264,15 @@ impl Proxy {
         Ok(())
     }
 
-    fn process_output_alt_screen(&mut self, data: &[u8], stdout_fd: i32) -> Result<()> {
+    fn process_output_alt_screen<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
         if let Some(exit_pos) = self.find_alt_screen_exit(data) {
-            write_all_raw(stdout_fd, &data[..exit_pos])?;
+            write_all(stdout_fd, &data[..exit_pos])?;
             let seq_len = self.alt_screen_exit_len(&data[exit_pos..]);
-            write_all_raw(stdout_fd, &data[exit_pos..exit_pos + seq_len])?;
+            write_all(stdout_fd, &data[exit_pos..exit_pos + seq_len])?;
             self.in_alternate_screen = false;
             return self.process_output(&data[exit_pos + seq_len..], stdout_fd);
         }
-        write_all_raw(stdout_fd, data)
+        write_all(stdout_fd, data)
     }
 
     fn find_alt_screen_enter(&self, data: &[u8]) -> Option<usize> {
@@ -317,7 +313,7 @@ impl Proxy {
         }
     }
 
-    fn flush_sync_block(&mut self, stdout_fd: i32) -> Result<()> {
+    fn flush_sync_block<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
         let has_clear_screen = self.clear_screen_finder.find(&self.sync_buffer).is_some();
         let has_cursor_home = self.cursor_home_finder.find(&self.sync_buffer).is_some();
         let is_full_redraw = has_clear_screen && has_cursor_home;
@@ -329,9 +325,9 @@ impl Proxy {
 
         if is_full_redraw {
             self.create_truncated_output();
-            write_all_raw(stdout_fd, &self.output_buffer)?;
+            write_all(stdout_fd, &self.output_buffer)?;
         } else {
-            write_all_raw(stdout_fd, &self.sync_buffer)?;
+            write_all(stdout_fd, &self.sync_buffer)?;
         }
 
         Ok(())
@@ -348,11 +344,9 @@ impl Proxy {
         self.output_buffer.extend_from_slice(SYNC_END);
     }
 
-    fn process_input(&mut self, data: &[u8], stdout_fd: i32) -> Result<()> {
-        let master_fd = self.pty_master.as_raw_fd();
-
+    fn process_input<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
         if self.in_alternate_screen {
-            return write_all_raw(master_fd, data);
+            return write_all(&self.pty_master, data);
         }
 
         for &byte in data {
@@ -367,7 +361,7 @@ impl Proxy {
             if self.input_buffer.len() > self.config.lookback_sequence.len() {
                 let excess = self.input_buffer.len() - self.config.lookback_sequence.len();
                 if !self.in_lookback_mode {
-                    write_all_raw(master_fd, &self.input_buffer[..excess])?;
+                    write_all(&self.pty_master, &self.input_buffer[..excess])?;
                 }
                 self.input_buffer.drain(..excess);
             }
@@ -385,7 +379,7 @@ impl Proxy {
                 .starts_with(&self.input_buffer)
             {
                 if !self.in_lookback_mode {
-                    write_all_raw(master_fd, &self.input_buffer)?;
+                    write_all(&self.pty_master, &self.input_buffer)?;
                 }
                 self.input_buffer.clear();
             }
@@ -400,21 +394,21 @@ impl Proxy {
         self.output_buffer.clear();
         self.history.append_all(&mut self.output_buffer);
 
-        let stdout_fd = io::stdout().as_raw_fd();
-        write_all_raw(stdout_fd, CLEAR_SCREEN)?;
-        write_all_raw(stdout_fd, CURSOR_HOME)?;
-        write_all_raw(stdout_fd, &self.output_buffer)?;
+        let stdout_fd = io::stdout();
+        write_all(&stdout_fd, CLEAR_SCREEN)?;
+        write_all(&stdout_fd, CURSOR_HOME)?;
+        write_all(&stdout_fd, &self.output_buffer)?;
 
         let exit_msg = format!(
             "\r\n\x1b[7m--- LOOKBACK MODE: press {} or Ctrl+C to exit ---\x1b[0m\r\n",
             self.config.lookback_key
         );
-        write_all_raw(stdout_fd, exit_msg.as_bytes())?;
+        write_all(&stdout_fd, exit_msg.as_bytes())?;
 
         Ok(())
     }
 
-    fn exit_lookback_mode(&mut self, stdout_fd: i32) -> Result<()> {
+    fn exit_lookback_mode<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
         self.in_lookback_mode = false;
 
         let cached = std::mem::take(&mut self.lookback_cache);
@@ -425,9 +419,9 @@ impl Proxy {
         self.output_buffer.clear();
         self.history.append_all(&mut self.output_buffer);
 
-        write_all_raw(stdout_fd, CLEAR_SCREEN)?;
-        write_all_raw(stdout_fd, CURSOR_HOME)?;
-        write_all_raw(stdout_fd, &self.output_buffer)?;
+        write_all(stdout_fd, CLEAR_SCREEN)?;
+        write_all(stdout_fd, CURSOR_HOME)?;
+        write_all(stdout_fd, &self.output_buffer)?;
 
         Ok(())
     }
@@ -442,10 +436,8 @@ impl Proxy {
     }
 
     fn forward_signal(&self, signal: Signal) {
-        let pid = self.child.id();
-        unsafe {
-            libc::kill(pid as i32, signal as i32);
-        }
+        let pid = Pid::from_raw(self.child.id() as i32);
+        let _ = kill(pid, signal);
     }
 
     fn wait_child(&mut self) -> Result<i32> {
@@ -487,8 +479,7 @@ fn exit_code_from_status(status: ExitStatus) -> i32 {
 
 fn setup_raw_mode() -> Result<Option<Termios>> {
     let stdin = io::stdin();
-    let is_tty = unsafe { libc::isatty(stdin.as_raw_fd()) == 1 };
-    if !is_tty {
+    if !isatty(&stdin).unwrap_or(false) {
         return Ok(None);
     }
 
@@ -524,32 +515,18 @@ fn set_nonblocking<Fd: AsFd>(fd: &Fd) -> Result<()> {
     Ok(())
 }
 
-fn write_all_raw(fd: i32, data: &[u8]) -> Result<()> {
+fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
     let mut written = 0;
     while written < data.len() {
-        match libc_write(fd, &data[written..]) {
+        match write(fd, &data[written..]) {
             Ok(n) => written += n,
-            Err(e) if e == libc::EAGAIN || e == libc::EINTR => continue,
-            Err(e) => anyhow::bail!("write failed: errno {}", e),
+            Err(Errno::EAGAIN) | Err(Errno::EINTR) => continue,
+            Err(e) => anyhow::bail!("write failed: {}", e),
         }
     }
     Ok(())
 }
 
-fn libc_read(fd: i32, buf: &mut [u8]) -> Result<usize, i32> {
-    let ret = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if ret < 0 {
-        Err(unsafe { *libc::__errno_location() })
-    } else {
-        Ok(ret as usize)
-    }
-}
-
-fn libc_write(fd: i32, buf: &[u8]) -> Result<usize, i32> {
-    let ret = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
-    if ret < 0 {
-        Err(unsafe { *libc::__errno_location() })
-    } else {
-        Ok(ret as usize)
-    }
+fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
+    read(fd.as_fd(), buf)
 }
