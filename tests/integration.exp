@@ -1,0 +1,237 @@
+#!/usr/bin/expect -f
+#
+# Integration tests for claude-chill
+# Tests lookback mode and alt-screen handling
+#
+# Usage: expect tests/integration.exp [path-to-binary]
+#
+
+set timeout 10
+set binary [lindex $argv 0]
+if {$binary eq ""} {
+    set binary "./target/debug/claude-chill"
+}
+
+# Use a simple, predictable prompt
+set env(PS1) "TEST> "
+set prompt "TEST> "
+
+proc fail {msg} {
+    puts "\n\033\[31mFAIL: $msg\033\[0m"
+    exit 1
+}
+
+proc pass {msg} {
+    puts "\033\[32mPASS: $msg\033\[0m"
+}
+
+# Build first if binary doesn't exist
+if {![file exists $binary]} {
+    puts "Building..."
+    if {[catch {exec cargo build 2>@1}]} {
+        fail "cargo build failed"
+    }
+}
+
+puts "Using binary: $binary"
+puts ""
+
+#############################################
+# Test 1: Basic spawn and exit
+#############################################
+puts "Test 1: Basic spawn and exit"
+
+spawn $binary -- /bin/bash --norc --noprofile
+expect {
+    $prompt { }
+    timeout { fail "shell prompt not received" }
+}
+
+send "echo hello\r"
+expect {
+    "hello" { }
+    timeout { fail "echo output not received" }
+}
+
+send "exit\r"
+expect {
+    eof { pass "Basic spawn and exit" }
+    timeout { fail "did not exit cleanly" }
+}
+
+#############################################
+# Test 2: Lookback mode toggle
+#############################################
+puts "\nTest 2: Lookback mode toggle"
+
+spawn $binary -- /bin/bash --norc --noprofile
+expect $prompt
+
+# Generate some output to look back at
+send "echo line1\r"
+expect $prompt
+send "echo line2\r"
+expect $prompt
+send "echo line3\r"
+expect $prompt
+
+# Enter lookback mode (Ctrl+^ = 0x1E)
+send "\x1e"
+expect {
+    "LOOKBACK MODE" { }
+    timeout { fail "lookback mode not entered" }
+}
+
+# Exit lookback mode (same key again)
+sleep 0.3
+send "\x1e"
+sleep 0.5
+
+# Should be back to normal - verify shell still works
+send "echo after_lookback\r"
+expect {
+    "after_lookback" { }
+    timeout { fail "shell not responsive after lookback" }
+}
+
+send "exit\r"
+expect {
+    eof { pass "Lookback mode toggle" }
+    timeout { fail "did not exit cleanly" }
+}
+
+#############################################
+# Test 3: Lookback mode exit with Ctrl+C
+#############################################
+puts "\nTest 3: Lookback mode exit with Ctrl+C"
+
+spawn $binary -- /bin/bash --norc --noprofile
+expect $prompt
+
+send "echo test_output\r"
+expect $prompt
+
+# Enter lookback mode
+send "\x1e"
+expect "LOOKBACK MODE"
+
+# Exit with Ctrl+C instead
+send "\x03"
+
+# Should be back to normal
+sleep 0.5
+send "echo still_works\r"
+expect {
+    "still_works" { }
+    timeout { fail "shell not responsive after Ctrl+C exit" }
+}
+
+send "exit\r"
+expect {
+    eof { pass "Lookback mode exit with Ctrl+C" }
+    timeout { fail "did not exit cleanly" }
+}
+
+#############################################
+# Test 4: Alt screen mode (using less)
+#############################################
+puts "\nTest 4: Alt screen mode"
+
+# Check if less is available
+if {[catch {exec which less}]} {
+    puts "SKIP: less not found"
+} else {
+    spawn $binary -- /bin/bash --norc --noprofile
+    expect $prompt
+
+    # Create a temp file and view with less
+    send "echo -e 'line1\\nline2\\nline3' | less\r"
+
+    # Wait for less to start (alt screen)
+    sleep 0.5
+
+    # Try lookback key - should pass through to less, not trigger lookback
+    # (In alt screen, lookback is disabled)
+    send "\x1e"
+    sleep 0.3
+
+    # Exit less
+    send "q"
+    expect $prompt
+
+    # Now test that lookback works again after exiting alt screen
+    send "echo back_from_less\r"
+    expect $prompt
+
+    send "\x1e"
+    expect {
+        "LOOKBACK MODE" { }
+        timeout { fail "lookback mode not working after alt screen" }
+    }
+
+    send "\x1e"
+    sleep 0.3
+
+    send "exit\r"
+    expect {
+        eof { pass "Alt screen mode" }
+        timeout { fail "did not exit cleanly" }
+    }
+}
+
+#############################################
+# Test 5: Alt screen with vi/vim (if available)
+#############################################
+puts "\nTest 5: Alt screen with vi/vim"
+
+# Try vim first, then vi
+set vi_cmd ""
+if {![catch {exec which vim}]} {
+    set vi_cmd "vim"
+} elseif {![catch {exec which vi}]} {
+    set vi_cmd "vi"
+}
+
+if {$vi_cmd eq ""} {
+    puts "SKIP: vi/vim not found"
+} else {
+    spawn $binary -- /bin/bash --norc --noprofile
+    expect $prompt
+
+    # Start vi/vim with no config to avoid user rc issues
+    send "$vi_cmd -u NONE\r"
+    sleep 1
+
+    # In vi, Ctrl+^ switches between buffers - should NOT trigger lookback
+    send "\x1e"
+    sleep 0.3
+
+    # Exit vi
+    send ":q!\r"
+    expect $prompt
+
+    # Lookback should work now
+    send "\x1e"
+    expect {
+        "LOOKBACK MODE" { }
+        timeout { fail "lookback mode not working after $vi_cmd" }
+    }
+
+    send "\x1e"
+    sleep 0.3
+
+    send "exit\r"
+    expect {
+        eof { pass "Alt screen with $vi_cmd" }
+        timeout { fail "did not exit cleanly" }
+    }
+}
+
+#############################################
+# Summary
+#############################################
+puts "\n\033\[32m========================================\033\[0m"
+puts "\033\[32mAll tests passed!\033\[0m"
+puts "\033\[32m========================================\033\[0m"
+
+exit 0
