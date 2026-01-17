@@ -23,11 +23,7 @@ use clap::Parser;
                   Keys: [a]-[z], [f1]-[f12], [pageup], [enter], [space], etc."
 )]
 pub struct Cli {
-    #[arg(
-        help = "Command to run",
-        required = true,
-        value_name = "COMMAND"
-    )]
+    #[arg(help = "Command to run", required = true, value_name = "COMMAND")]
     pub command: String,
 
     #[arg(
