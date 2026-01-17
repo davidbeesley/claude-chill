@@ -53,6 +53,29 @@ impl Default for ProxyConfig {
     }
 }
 
+struct TerminalGuard {
+    original_termios: Option<Termios>,
+}
+
+impl TerminalGuard {
+    fn new() -> Result<Self> {
+        let original_termios = setup_raw_mode()?;
+        Ok(Self { original_termios })
+    }
+
+    fn take(mut self) -> Option<Termios> {
+        self.original_termios.take()
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if let Some(ref termios) = self.original_termios {
+            let _ = tcsetattr(io::stdin(), SetArg::TCSANOW, termios);
+        }
+    }
+}
+
 pub struct Proxy {
     config: ProxyConfig,
     pty_master: OwnedFd,
@@ -81,7 +104,7 @@ impl Proxy {
         let winsize = get_terminal_size()?;
         let pty = openpty(&winsize, None).context("openpty failed")?;
 
-        let original_termios = setup_raw_mode()?;
+        let terminal_guard = TerminalGuard::new()?;
         setup_signal_handlers()?;
 
         let slave_fd = pty.slave.as_raw_fd();
@@ -122,7 +145,7 @@ impl Proxy {
             config,
             pty_master: pty.master,
             child,
-            original_termios,
+            original_termios: terminal_guard.take(),
             sync_buffer: Vec::with_capacity(SYNC_BUFFER_CAPACITY),
             in_sync_block: false,
             in_lookback_mode: false,

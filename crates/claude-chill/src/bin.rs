@@ -45,7 +45,7 @@ fn main() -> ExitCode {
             }
         },
         Err(e) => {
-            eprintln!("Failed to start proxy: {}", e);
+            eprintln!("Failed to start proxy: {:#}", e);
             ExitCode::from(1)
         }
     }
