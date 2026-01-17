@@ -1,5 +1,12 @@
 # claude-chill
 
+[![CI](https://github.com/davidbeesley/claude-chill/actions/workflows/ci.yml/badge.svg)](https://github.com/davidbeesley/claude-chill/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/davidbeesley/claude-chill)](https://github.com/davidbeesley/claude-chill/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/davidbeesley/claude-chill)](https://github.com/davidbeesley/claude-chill/network)
+![GitHub repo size](https://img.shields.io/github/repo-size/davidbeesley/claude-chill)
+![Rust](https://img.shields.io/badge/rust-2024-orange)
+
 A PTY proxy that tames Claude Code's massive terminal updates.
 
 ## The Problem
@@ -75,6 +82,10 @@ Keys: `[a]`-`[z]`, `[f1]`-`[f12]`, `[pageup]`, `[pagedown]`, `[home]`, `[end]`, 
 ## Disclaimer
 
 This tool was developed for personal convenience on Debian Linux. It works for me, but it hasn't been extensively tested across different terminals, operating systems, or edge cases. Don't use it to send anyone to space, perform surgery, or run critical infrastructure. If it breaks, you get to keep both pieces.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
