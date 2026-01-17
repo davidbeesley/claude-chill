@@ -241,22 +241,42 @@ fn key_to_escape_sequence(code: &KeyCode, modifiers: &Modifiers) -> Vec<u8> {
                 b" ".to_vec()
             }
         }
-        KeyCode::Char(c) => {
-            if modifiers.ctrl && c.is_ascii_alphabetic() {
-                let ctrl_char = (c.to_ascii_uppercase() as u8) - b'A' + 1;
-                if modifiers.alt {
-                    vec![0x1b, ctrl_char]
-                } else {
-                    vec![ctrl_char]
-                }
-            } else if modifiers.alt {
-                vec![0x1b, *c as u8]
-            } else if modifiers.shift {
-                vec![c.to_ascii_uppercase() as u8]
+        KeyCode::Char(c) => char_to_escape_sequence(*c, modifiers),
+    }
+}
+
+fn char_to_escape_sequence(c: char, modifiers: &Modifiers) -> Vec<u8> {
+    if modifiers.ctrl {
+        let ctrl_byte = match c {
+            'a'..='z' => Some((c.to_ascii_uppercase() as u8) - b'A' + 1),
+            'A'..='Z' => Some((c as u8) - b'A' + 1),
+            '@' => Some(0x00),
+            '[' => Some(0x1B),
+            '\\' => Some(0x1C),
+            ']' => Some(0x1D),
+            '^' | '6' => Some(0x1E),
+            '_' | '7' => Some(0x1F),
+            '2' => Some(0x00),
+            '3' => Some(0x1B),
+            '4' => Some(0x1C),
+            '5' => Some(0x1D),
+            '8' => Some(0x7F),
+            _ => None,
+        };
+        if let Some(byte) = ctrl_byte {
+            return if modifiers.alt {
+                vec![0x1b, byte]
             } else {
-                vec![*c as u8]
-            }
+                vec![byte]
+            };
         }
+    }
+    if modifiers.alt {
+        vec![0x1b, c as u8]
+    } else if modifiers.shift {
+        vec![c.to_ascii_uppercase() as u8]
+    } else {
+        vec![c as u8]
     }
 }
 
@@ -382,5 +402,29 @@ mod tests {
     fn test_error_no_key() {
         let result = parse("[ctrl][shift]");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ctrl_caret() {
+        let key = parse("[ctrl][^]").unwrap();
+        assert_eq!(key.to_escape_sequence(), vec![0x1E]);
+    }
+
+    #[test]
+    fn test_ctrl_6_same_as_ctrl_caret() {
+        let key = parse("[ctrl][6]").unwrap();
+        assert_eq!(key.to_escape_sequence(), vec![0x1E]);
+    }
+
+    #[test]
+    fn test_ctrl_bracket() {
+        let key = parse("[ctrl][[]").unwrap();
+        assert_eq!(key.to_escape_sequence(), vec![0x1B]);
+    }
+
+    #[test]
+    fn test_ctrl_backslash() {
+        let key = parse("[ctrl][\\]").unwrap();
+        assert_eq!(key.to_escape_sequence(), vec![0x1C]);
     }
 }

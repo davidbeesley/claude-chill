@@ -43,8 +43,8 @@ impl Default for ProxyConfig {
         Self {
             max_output_lines: 100,
             max_history_lines: 100_000,
-            lookback_key: "[ctrl][shift][j]".to_string(),
-            lookback_sequence: vec![0x0A],
+            lookback_key: "[ctrl][6]".to_string(),
+            lookback_sequence: vec![0x1E],
         }
     }
 }

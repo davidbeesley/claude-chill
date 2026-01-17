@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 
-const DEFAULT_LOOKBACK_KEY: &str = "[ctrl][shift][j]";
+const DEFAULT_LOOKBACK_KEY: &str = "[ctrl][6]";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -89,12 +89,12 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.max_lines, 100);
         assert_eq!(config.history_lines, 100_000);
-        assert_eq!(config.lookback_key, "[ctrl][shift][j]");
+        assert_eq!(config.lookback_key, "[ctrl][6]");
     }
 
     #[test]
     fn test_default_lookback_sequence() {
         let config = Config::default();
-        assert_eq!(config.lookback_sequence(), vec![0x0A]);
+        assert_eq!(config.lookback_sequence(), vec![0x1E]);
     }
 }

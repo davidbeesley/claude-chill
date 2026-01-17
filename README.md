@@ -45,7 +45,7 @@ claude-chill -l 50 -- claude       # Set max lines to 50
 
 ## Lookback Mode
 
-Press `Ctrl+Shift+J` (or your configured key) to enter lookback mode:
+Press `Ctrl+6` (or your configured key) to enter lookback mode:
 
 1. **Claude pauses** - Output from Claude is cached, input is blocked
 2. **History dumps** - The full history buffer is written to your terminal
@@ -61,7 +61,7 @@ Create `~/.config/claude-chill.toml`:
 ```toml
 max_lines = 100        # Lines shown per sync block
 history_lines = 100000 # Lines stored for lookback
-lookback_key = "[ctrl][shift][j]"
+lookback_key = "[ctrl][6]"
 ```
 
 ### Key Format
@@ -71,6 +71,10 @@ lookback_key = "[ctrl][shift][j]"
 Modifiers: `[ctrl]`, `[shift]`, `[alt]`
 
 Keys: `[a]`-`[z]`, `[f1]`-`[f12]`, `[pageup]`, `[pagedown]`, `[home]`, `[end]`, `[enter]`, `[tab]`, `[space]`, `[esc]`
+
+### Why Ctrl+6?
+
+`Ctrl+6` sends 0x1E, a control character not used by terminals, signals, or shells. Avoid `Ctrl+letter` hotkeys - terminals can't distinguish `Ctrl+J` from `Ctrl+Shift+J`.
 
 ## Disclaimer
 
