@@ -93,7 +93,7 @@ impl Proxy {
                     if libc::setsid() == -1 {
                         return Err(io::Error::last_os_error());
                     }
-                    if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
+                    if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
                         return Err(io::Error::last_os_error());
                     }
                     if libc::dup2(slave_fd, 0) == -1 {
@@ -429,7 +429,11 @@ impl Proxy {
     fn forward_winsize(&self) -> Result<()> {
         if let Ok(winsize) = get_terminal_size() {
             unsafe {
-                libc::ioctl(self.pty_master.as_raw_fd(), libc::TIOCSWINSZ, &winsize);
+                libc::ioctl(
+                    self.pty_master.as_raw_fd(),
+                    libc::TIOCSWINSZ as libc::c_ulong,
+                    &winsize,
+                );
             }
         }
         Ok(())
@@ -458,7 +462,13 @@ impl Drop for Proxy {
 
 fn get_terminal_size() -> Result<Winsize> {
     let mut ws: Winsize = unsafe { std::mem::zeroed() };
-    let ret = unsafe { libc::ioctl(io::stdout().as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
+    let ret = unsafe {
+        libc::ioctl(
+            io::stdout().as_raw_fd(),
+            libc::TIOCGWINSZ as libc::c_ulong,
+            &mut ws,
+        )
+    };
     if ret == -1 {
         ws.ws_row = 24;
         ws.ws_col = 80;
