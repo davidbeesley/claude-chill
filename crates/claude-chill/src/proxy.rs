@@ -1,4 +1,5 @@
 use crate::escape_sequences::{
+    ALT_SCREEN_ENTER, ALT_SCREEN_ENTER_LEGACY, ALT_SCREEN_EXIT, ALT_SCREEN_EXIT_LEGACY,
     CLEAR_SCREEN, CLEAR_SCROLLBACK, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY,
     SYNC_BUFFER_CAPACITY, SYNC_END, SYNC_START,
 };
@@ -58,6 +59,7 @@ pub struct Proxy {
     sync_buffer: Vec<u8>,
     in_sync_block: bool,
     in_lookback_mode: bool,
+    in_alternate_screen: bool,
     lookback_cache: Vec<u8>,
     input_buffer: Vec<u8>,
     output_buffer: Vec<u8>,
@@ -65,6 +67,10 @@ pub struct Proxy {
     sync_end_finder: memmem::Finder<'static>,
     clear_screen_finder: memmem::Finder<'static>,
     cursor_home_finder: memmem::Finder<'static>,
+    alt_screen_enter_finder: memmem::Finder<'static>,
+    alt_screen_exit_finder: memmem::Finder<'static>,
+    alt_screen_enter_legacy_finder: memmem::Finder<'static>,
+    alt_screen_exit_legacy_finder: memmem::Finder<'static>,
 }
 
 impl Proxy {
@@ -117,6 +123,7 @@ impl Proxy {
             sync_buffer: Vec::with_capacity(SYNC_BUFFER_CAPACITY),
             in_sync_block: false,
             in_lookback_mode: false,
+            in_alternate_screen: false,
             lookback_cache: Vec::new(),
             input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
             output_buffer: Vec::with_capacity(OUTPUT_BUFFER_CAPACITY),
@@ -124,6 +131,10 @@ impl Proxy {
             sync_end_finder: memmem::Finder::new(SYNC_END),
             clear_screen_finder: memmem::Finder::new(CLEAR_SCREEN),
             cursor_home_finder: memmem::Finder::new(CURSOR_HOME),
+            alt_screen_enter_finder: memmem::Finder::new(ALT_SCREEN_ENTER),
+            alt_screen_exit_finder: memmem::Finder::new(ALT_SCREEN_EXIT),
+            alt_screen_enter_legacy_finder: memmem::Finder::new(ALT_SCREEN_ENTER_LEGACY),
+            alt_screen_exit_legacy_finder: memmem::Finder::new(ALT_SCREEN_EXIT_LEGACY),
         })
     }
 
@@ -201,6 +212,10 @@ impl Proxy {
     }
 
     fn process_output(&mut self, data: &[u8], stdout_fd: i32) -> Result<()> {
+        if self.in_alternate_screen {
+            return self.process_output_alt_screen(data, stdout_fd);
+        }
+
         if self.in_lookback_mode {
             self.lookback_cache.extend_from_slice(data);
             return Ok(());
@@ -209,6 +224,21 @@ impl Proxy {
         let mut pos = 0;
 
         while pos < data.len() {
+            if let Some(alt_pos) = self.find_alt_screen_enter(&data[pos..]) {
+                if self.in_sync_block {
+                    self.sync_buffer.extend_from_slice(&data[pos..pos + alt_pos]);
+                    write_all_raw(stdout_fd, &self.sync_buffer)?;
+                    self.sync_buffer.clear();
+                    self.in_sync_block = false;
+                } else if alt_pos > 0 {
+                    write_all_raw(stdout_fd, &data[pos..pos + alt_pos])?;
+                }
+                self.in_alternate_screen = true;
+                let seq_len = self.alt_screen_enter_len(&data[pos + alt_pos..]);
+                write_all_raw(stdout_fd, &data[pos + alt_pos..pos + alt_pos + seq_len])?;
+                return self.process_output_alt_screen(&data[pos + alt_pos + seq_len..], stdout_fd);
+            }
+
             if self.in_sync_block {
                 if let Some(idx) = self.sync_end_finder.find(&data[pos..]) {
                     self.sync_buffer.extend_from_slice(&data[pos..pos + idx]);
@@ -235,6 +265,55 @@ impl Proxy {
         }
 
         Ok(())
+    }
+
+    fn process_output_alt_screen(&mut self, data: &[u8], stdout_fd: i32) -> Result<()> {
+        if let Some(exit_pos) = self.find_alt_screen_exit(data) {
+            write_all_raw(stdout_fd, &data[..exit_pos])?;
+            let seq_len = self.alt_screen_exit_len(&data[exit_pos..]);
+            write_all_raw(stdout_fd, &data[exit_pos..exit_pos + seq_len])?;
+            self.in_alternate_screen = false;
+            return self.process_output(&data[exit_pos + seq_len..], stdout_fd);
+        }
+        write_all_raw(stdout_fd, data)
+    }
+
+    fn find_alt_screen_enter(&self, data: &[u8]) -> Option<usize> {
+        let pos1 = self.alt_screen_enter_finder.find(data);
+        let pos2 = self.alt_screen_enter_legacy_finder.find(data);
+        match (pos1, pos2) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    fn find_alt_screen_exit(&self, data: &[u8]) -> Option<usize> {
+        let pos1 = self.alt_screen_exit_finder.find(data);
+        let pos2 = self.alt_screen_exit_legacy_finder.find(data);
+        match (pos1, pos2) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    fn alt_screen_enter_len(&self, data: &[u8]) -> usize {
+        if data.starts_with(ALT_SCREEN_ENTER) {
+            ALT_SCREEN_ENTER.len()
+        } else {
+            ALT_SCREEN_ENTER_LEGACY.len()
+        }
+    }
+
+    fn alt_screen_exit_len(&self, data: &[u8]) -> usize {
+        if data.starts_with(ALT_SCREEN_EXIT) {
+            ALT_SCREEN_EXIT.len()
+        } else {
+            ALT_SCREEN_EXIT_LEGACY.len()
+        }
     }
 
     fn flush_sync_block(&mut self, stdout_fd: i32) -> Result<()> {
@@ -270,6 +349,10 @@ impl Proxy {
 
     fn process_input(&mut self, data: &[u8], stdout_fd: i32) -> Result<()> {
         let master_fd = self.pty_master.as_raw_fd();
+
+        if self.in_alternate_screen {
+            return write_all_raw(master_fd, data);
+        }
 
         for &byte in data {
             if self.in_lookback_mode && byte == 0x03 {
