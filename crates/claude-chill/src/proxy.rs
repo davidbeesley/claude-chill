@@ -226,7 +226,8 @@ impl Proxy {
         while pos < data.len() {
             if let Some(alt_pos) = self.find_alt_screen_enter(&data[pos..]) {
                 if self.in_sync_block {
-                    self.sync_buffer.extend_from_slice(&data[pos..pos + alt_pos]);
+                    self.sync_buffer
+                        .extend_from_slice(&data[pos..pos + alt_pos]);
                     write_all_raw(stdout_fd, &self.sync_buffer)?;
                     self.sync_buffer.clear();
                     self.in_sync_block = false;
