@@ -1,8 +1,6 @@
-use crate::escape_parser::{EscapeParser, ParsedEscape};
 use crate::escape_sequences::{
     CLEAR_SCREEN, CLEAR_SCROLLBACK, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY,
-    PASSTHROUGH_BUFFER_CAPACITY, PENDING_ESCAPE_CAPACITY, SYNC_BUFFER_CAPACITY, SYNC_END,
-    SYNC_START,
+    SYNC_BUFFER_CAPACITY, SYNC_END, SYNC_START,
 };
 use crate::line_buffer::LineBuffer;
 use anyhow::{Context, Result};
@@ -59,11 +57,10 @@ pub struct Proxy {
     history: LineBuffer,
     sync_buffer: Vec<u8>,
     in_sync_block: bool,
-    parser: EscapeParser,
     input_buffer: Vec<u8>,
-    passthrough_buffer: Vec<u8>,
     output_buffer: Vec<u8>,
-    pending_escape: Vec<u8>,
+    sync_start_finder: memmem::Finder<'static>,
+    sync_end_finder: memmem::Finder<'static>,
     clear_screen_finder: memmem::Finder<'static>,
     cursor_home_finder: memmem::Finder<'static>,
 }
@@ -117,11 +114,10 @@ impl Proxy {
             original_termios,
             sync_buffer: Vec::with_capacity(SYNC_BUFFER_CAPACITY),
             in_sync_block: false,
-            parser: EscapeParser::new(),
             input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
-            passthrough_buffer: Vec::with_capacity(PASSTHROUGH_BUFFER_CAPACITY),
             output_buffer: Vec::with_capacity(OUTPUT_BUFFER_CAPACITY),
-            pending_escape: Vec::with_capacity(PENDING_ESCAPE_CAPACITY),
+            sync_start_finder: memmem::Finder::new(SYNC_START),
+            sync_end_finder: memmem::Finder::new(SYNC_END),
             clear_screen_finder: memmem::Finder::new(CLEAR_SCREEN),
             cursor_home_finder: memmem::Finder::new(CURSOR_HOME),
         })
@@ -201,74 +197,35 @@ impl Proxy {
     }
 
     fn process_output(&mut self, data: &[u8], stdout_fd: i32) -> Result<()> {
-        self.passthrough_buffer.clear();
+        let mut pos = 0;
 
-        for &byte in data {
-            let in_escape = self.parser.in_escape_sequence();
-
-            if in_escape && self.pending_escape.is_empty() {
-                self.pending_escape.push(0x1b);
-            }
-
-            if let Some(event) = self.parser.feed(byte) {
-                match event {
-                    ParsedEscape::SyncStart => {
-                        if !self.passthrough_buffer.is_empty() {
-                            write_all_raw(stdout_fd, &self.passthrough_buffer)?;
-                            self.passthrough_buffer.clear();
-                        }
-                        self.pending_escape.clear();
-                        self.in_sync_block = true;
-                        self.sync_buffer.clear();
-                        self.sync_buffer.extend_from_slice(SYNC_START);
-                        continue;
-                    }
-                    ParsedEscape::SyncEnd => {
-                        self.pending_escape.clear();
-                        if self.in_sync_block {
-                            self.sync_buffer.extend_from_slice(SYNC_END);
-                            self.flush_sync_block(stdout_fd)?;
-                            self.in_sync_block = false;
-                        }
-                        continue;
-                    }
-                    _ => {
-                        self.flush_pending_escape();
-                    }
+        while pos < data.len() {
+            if self.in_sync_block {
+                if let Some(idx) = self.sync_end_finder.find(&data[pos..]) {
+                    self.sync_buffer.extend_from_slice(&data[pos..pos + idx]);
+                    self.sync_buffer.extend_from_slice(SYNC_END);
+                    self.flush_sync_block(stdout_fd)?;
+                    self.in_sync_block = false;
+                    pos += idx + SYNC_END.len();
+                } else {
+                    self.sync_buffer.extend_from_slice(&data[pos..]);
+                    break;
                 }
-            }
-
-            if !self.parser.in_escape_sequence() && !self.pending_escape.is_empty() {
-                self.flush_pending_escape();
-            }
-
-            if self.parser.in_escape_sequence() {
-                self.pending_escape.push(byte);
-            } else if self.in_sync_block {
-                self.sync_buffer.push(byte);
+            } else if let Some(idx) = self.sync_start_finder.find(&data[pos..]) {
+                if idx > 0 {
+                    write_all_raw(stdout_fd, &data[pos..pos + idx])?;
+                }
+                self.in_sync_block = true;
+                self.sync_buffer.clear();
+                self.sync_buffer.extend_from_slice(SYNC_START);
+                pos += idx + SYNC_START.len();
             } else {
-                self.passthrough_buffer.push(byte);
+                write_all_raw(stdout_fd, &data[pos..])?;
+                break;
             }
         }
 
-        if !self.pending_escape.is_empty() && !self.parser.in_escape_sequence() {
-            self.flush_pending_escape();
-        }
-
-        if !self.passthrough_buffer.is_empty() {
-            write_all_raw(stdout_fd, &self.passthrough_buffer)?;
-        }
         Ok(())
-    }
-
-    fn flush_pending_escape(&mut self) {
-        if self.in_sync_block {
-            self.sync_buffer.extend_from_slice(&self.pending_escape);
-        } else {
-            self.passthrough_buffer
-                .extend_from_slice(&self.pending_escape);
-        }
-        self.pending_escape.clear();
     }
 
     fn flush_sync_block(&mut self, stdout_fd: i32) -> Result<()> {
@@ -278,13 +235,10 @@ impl Proxy {
 
         if is_full_redraw {
             self.history.clear();
-            let content_start = self.find_content_start();
-            let content_end = self.sync_buffer.len().saturating_sub(SYNC_END.len());
-            if content_start < content_end {
-                self.history
-                    .push_bytes(&self.sync_buffer[content_start..content_end]);
-            }
+        }
+        self.history.push_bytes(&self.sync_buffer);
 
+        if is_full_redraw {
             self.create_truncated_output();
             write_all_raw(stdout_fd, &self.output_buffer)?;
         } else {
@@ -303,28 +257,6 @@ impl Proxy {
         self.history
             .append_last_n_lines(self.config.max_output_lines, &mut self.output_buffer);
         self.output_buffer.extend_from_slice(SYNC_END);
-    }
-
-    fn find_content_start(&self) -> usize {
-        let sync_start_finder = memmem::Finder::new(SYNC_START);
-        let clear_screen_finder = memmem::Finder::new(CLEAR_SCREEN);
-        let clear_scrollback_finder = memmem::Finder::new(CLEAR_SCROLLBACK);
-        let cursor_home_finder = memmem::Finder::new(CURSOR_HOME);
-
-        let mut pos = 0;
-        if let Some(idx) = sync_start_finder.find(&self.sync_buffer[pos..]) {
-            pos += idx + SYNC_START.len();
-        }
-        if let Some(idx) = clear_screen_finder.find(&self.sync_buffer[pos..]) {
-            pos += idx + CLEAR_SCREEN.len();
-        }
-        if let Some(idx) = clear_scrollback_finder.find(&self.sync_buffer[pos..]) {
-            pos += idx + CLEAR_SCROLLBACK.len();
-        }
-        if let Some(idx) = cursor_home_finder.find(&self.sync_buffer[pos..]) {
-            pos += idx + CURSOR_HOME.len();
-        }
-        pos
     }
 
     fn process_input(&mut self, data: &[u8], stdout_fd: i32) -> Result<()> {

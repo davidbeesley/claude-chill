@@ -8,6 +8,18 @@ Claude Code uses synchronized output to update the terminal atomically. It wraps
 
 The problem: Claude Code sends *entire* screen redraws in these sync blocks - often thousands of lines. Your terminal receives a 5000-line atomic update when only 20 lines are visible. This causes lag, flicker, and makes scrollback useless since each update clears history.
 
+Analysis of terminal recordings confirms Claude Code wraps 100% of its output in sync blocks - every byte of visible output goes through synchronized updates.
+
+Sync blocks start with one of three patterns (from a 3.5GB recording sample):
+
+| Pattern | Count | Frequency | Avg Size |
+|---------|-------|-----------|----------|
+| Line clearing (`2K` + `1A` repeated) | 3,544 | 55% | 2.7 KB |
+| Full screen clear (`2J` + `3J` + `H`) | 2,891 | 45% | 94.5 KB |
+| CRLF + color codes | 1 | <1% | 2.0 KB |
+
+The full screen clears are 35x larger than incremental line clears - these are the real problem.
+
 ## The Solution
 
 claude-chill sits between your terminal and Claude Code:

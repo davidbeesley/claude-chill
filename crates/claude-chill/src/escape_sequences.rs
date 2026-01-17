@@ -5,7 +5,5 @@ pub const CLEAR_SCROLLBACK: &[u8] = b"\x1b[3J";
 pub const CURSOR_HOME: &[u8] = b"\x1b[H";
 
 pub const SYNC_BUFFER_CAPACITY: usize = 1024 * 1024;
-pub const PASSTHROUGH_BUFFER_CAPACITY: usize = 65536;
 pub const OUTPUT_BUFFER_CAPACITY: usize = 32768;
-pub const PENDING_ESCAPE_CAPACITY: usize = 32;
 pub const INPUT_BUFFER_CAPACITY: usize = 64;
