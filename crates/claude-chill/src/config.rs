@@ -4,7 +4,8 @@ use std::fs;
 use std::path::PathBuf;
 
 const DEFAULT_LOOKBACK_KEY: &str = "[ctrl][6]";
-const DEFAULT_REDRAW_THROTTLE_MS: u64 = 50;
+const DEFAULT_EDIT_CONFIG_KEY: &str = "[ctrl][7]";
+const DEFAULT_REFRESH_RATE: u64 = 20;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -12,7 +13,8 @@ pub struct Config {
     pub max_lines: usize,
     pub history_lines: usize,
     pub lookback_key: String,
-    pub redraw_throttle_ms: u64,
+    pub edit_config_key: String,
+    pub refresh_rate: u64,
 }
 
 impl Default for Config {
@@ -21,7 +23,8 @@ impl Default for Config {
             max_lines: 100,
             history_lines: 100_000,
             lookback_key: DEFAULT_LOOKBACK_KEY.to_string(),
-            redraw_throttle_ms: DEFAULT_REDRAW_THROTTLE_MS,
+            edit_config_key: DEFAULT_EDIT_CONFIG_KEY.to_string(),
+            refresh_rate: DEFAULT_REFRESH_RATE,
         }
     }
 }
@@ -81,6 +84,30 @@ impl Config {
                     .unwrap_or_else(|_| b"\x1b[5;6~".to_vec())
             })
     }
+
+    pub fn parse_edit_config_key(&self) -> Result<KeyCombination, key_parser::ParseKeyError> {
+        key_parser::parse(&self.edit_config_key)
+    }
+
+    pub fn edit_config_sequence(&self) -> Vec<u8> {
+        self.parse_edit_config_key()
+            .map(|k| k.to_escape_sequence())
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "Warning: Invalid edit_config_key '{}': {}",
+                    self.edit_config_key, e
+                );
+                eprintln!("Using default: {}", DEFAULT_EDIT_CONFIG_KEY);
+                key_parser::parse(DEFAULT_EDIT_CONFIG_KEY)
+                    .map(|k| k.to_escape_sequence())
+                    .unwrap_or_else(|_| vec![0x1F])
+            })
+    }
+
+    pub fn redraw_throttle_ms(&self) -> u64 {
+        let rate = self.refresh_rate.max(1);
+        1000 / rate
+    }
 }
 
 #[cfg(test)]
@@ -93,7 +120,8 @@ mod tests {
         assert_eq!(config.max_lines, 100);
         assert_eq!(config.history_lines, 100_000);
         assert_eq!(config.lookback_key, "[ctrl][6]");
-        assert_eq!(config.redraw_throttle_ms, 50);
+        assert_eq!(config.refresh_rate, 20);
+        assert_eq!(config.redraw_throttle_ms(), 50);
     }
 
     #[test]

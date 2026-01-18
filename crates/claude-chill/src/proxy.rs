@@ -24,6 +24,13 @@ static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
 static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequenceMatch {
+    Complete,
+    Partial,
+    None,
+}
+
 extern "C" fn handle_sigwinch(_: libc::c_int) {
     SIGWINCH_RECEIVED.store(true, Ordering::SeqCst);
 }
@@ -41,6 +48,8 @@ pub struct ProxyConfig {
     pub max_history_lines: usize,
     pub lookback_key: String,
     pub lookback_sequence: Vec<u8>,
+    pub edit_config_key: String,
+    pub edit_config_sequence: Vec<u8>,
     pub redraw_throttle_ms: u64,
 }
 
@@ -51,6 +60,8 @@ impl Default for ProxyConfig {
             max_history_lines: 100_000,
             lookback_key: "[ctrl][6]".to_string(),
             lookback_sequence: vec![0x1E],
+            edit_config_key: "[ctrl][7]".to_string(),
+            edit_config_sequence: vec![0x1F],
             redraw_throttle_ms: 50,
         }
     }
@@ -90,7 +101,8 @@ pub struct Proxy {
     in_lookback_mode: bool,
     in_alternate_screen: bool,
     lookback_cache: Vec<u8>,
-    input_buffer: Vec<u8>,
+    lookback_input_buffer: Vec<u8>,
+    edit_config_input_buffer: Vec<u8>,
     output_buffer: Vec<u8>,
     redraw_throttler: RedrawThrottler,
     sync_start_finder: memmem::Finder<'static>,
@@ -157,7 +169,8 @@ impl Proxy {
             in_lookback_mode: false,
             in_alternate_screen: false,
             lookback_cache: Vec::new(),
-            input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
+            lookback_input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
+            edit_config_input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
             output_buffer: Vec::with_capacity(OUTPUT_BUFFER_CAPACITY),
             redraw_throttler,
             sync_start_finder: memmem::Finder::new(SYNC_START),
@@ -401,40 +414,108 @@ impl Proxy {
 
         for &byte in data {
             if self.in_lookback_mode && byte == 0x03 {
-                self.input_buffer.clear();
+                self.lookback_input_buffer.clear();
+                self.edit_config_input_buffer.clear();
                 self.exit_lookback_mode(stdout_fd)?;
                 continue;
             }
 
-            self.input_buffer.push(byte);
+            let lookback_action = self.check_sequence_match(
+                byte,
+                &mut self.lookback_input_buffer.clone(),
+                &self.config.lookback_sequence.clone(),
+            );
+            let edit_config_action = self.check_sequence_match(
+                byte,
+                &mut self.edit_config_input_buffer.clone(),
+                &self.config.edit_config_sequence.clone(),
+            );
 
-            if self.input_buffer.len() > self.config.lookback_sequence.len() {
-                let excess = self.input_buffer.len() - self.config.lookback_sequence.len();
-                if !self.in_lookback_mode {
-                    write_all(&self.pty_master, &self.input_buffer[..excess])?;
-                }
-                self.input_buffer.drain(..excess);
+            self.lookback_input_buffer.push(byte);
+            self.edit_config_input_buffer.push(byte);
+
+            if self.lookback_input_buffer.len() > self.config.lookback_sequence.len() {
+                let excess = self.lookback_input_buffer.len() - self.config.lookback_sequence.len();
+                self.lookback_input_buffer.drain(..excess);
+            }
+            if self.edit_config_input_buffer.len() > self.config.edit_config_sequence.len() {
+                let excess =
+                    self.edit_config_input_buffer.len() - self.config.edit_config_sequence.len();
+                self.edit_config_input_buffer.drain(..excess);
             }
 
-            if self.input_buffer == self.config.lookback_sequence {
-                self.input_buffer.clear();
-                if self.in_lookback_mode {
-                    self.exit_lookback_mode(stdout_fd)?;
-                } else {
-                    self.enter_lookback_mode()?;
+            match lookback_action {
+                SequenceMatch::Complete => {
+                    self.lookback_input_buffer.clear();
+                    self.edit_config_input_buffer.clear();
+                    if self.in_lookback_mode {
+                        self.exit_lookback_mode(stdout_fd)?;
+                    } else {
+                        self.enter_lookback_mode()?;
+                    }
+                    continue;
                 }
-            } else if !self
-                .config
-                .lookback_sequence
-                .starts_with(&self.input_buffer)
+                SequenceMatch::Partial => {}
+                SequenceMatch::None => {
+                    if !self
+                        .config
+                        .lookback_sequence
+                        .starts_with(&self.lookback_input_buffer)
+                    {
+                        self.lookback_input_buffer.clear();
+                    }
+                }
+            }
+
+            match edit_config_action {
+                SequenceMatch::Complete => {
+                    self.lookback_input_buffer.clear();
+                    self.edit_config_input_buffer.clear();
+                    if !self.in_lookback_mode {
+                        self.open_config_editor(stdout_fd)?;
+                    }
+                    continue;
+                }
+                SequenceMatch::Partial => {}
+                SequenceMatch::None => {
+                    if !self
+                        .config
+                        .edit_config_sequence
+                        .starts_with(&self.edit_config_input_buffer)
+                    {
+                        self.edit_config_input_buffer.clear();
+                    }
+                }
+            }
+
+            if lookback_action == SequenceMatch::None
+                && edit_config_action == SequenceMatch::None
+                && !self.in_lookback_mode
             {
-                if !self.in_lookback_mode {
-                    write_all(&self.pty_master, &self.input_buffer)?;
-                }
-                self.input_buffer.clear();
+                write_all(&self.pty_master, &[byte])?;
             }
         }
         Ok(())
+    }
+
+    fn check_sequence_match(
+        &self,
+        byte: u8,
+        buffer: &mut Vec<u8>,
+        sequence: &[u8],
+    ) -> SequenceMatch {
+        buffer.push(byte);
+        if buffer.len() > sequence.len() {
+            let excess = buffer.len() - sequence.len();
+            buffer.drain(..excess);
+        }
+        if buffer.as_slice() == sequence {
+            SequenceMatch::Complete
+        } else if sequence.starts_with(buffer) {
+            SequenceMatch::Partial
+        } else {
+            SequenceMatch::None
+        }
     }
 
     fn enter_lookback_mode(&mut self) -> Result<()> {
@@ -466,13 +547,135 @@ impl Proxy {
             self.process_output(&cached, stdout_fd)?;
         }
 
+        self.forward_winsize()?;
+
         self.output_buffer.clear();
         self.history.append_all(&mut self.output_buffer);
 
         write_all(stdout_fd, CLEAR_SCREEN)?;
+        write_all(stdout_fd, CLEAR_SCROLLBACK)?;
         write_all(stdout_fd, CURSOR_HOME)?;
         write_all(stdout_fd, &self.output_buffer)?;
 
+        Ok(())
+    }
+
+    fn open_config_editor<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        use crate::config::Config;
+
+        let config_path = match Config::config_path() {
+            Some(path) => path,
+            None => {
+                let msg = "\r\n\x1b[33mCould not determine config path\x1b[0m\r\n";
+                write_all(stdout_fd, msg.as_bytes())?;
+                return Ok(());
+            }
+        };
+
+        if !config_path.exists() {
+            if let Some(parent) = config_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let default_config = r#"# claude-chill configuration
+max_lines = 100
+history_lines = 100000
+lookback_key = "[ctrl][6]"
+edit_config_key = "[ctrl][7]"
+
+# Refreshes per second
+refresh_rate = 20
+"#;
+            if let Err(e) = std::fs::write(&config_path, default_config) {
+                let msg = format!("\r\n\x1b[33mFailed to create config file: {}\x1b[0m\r\n", e);
+                write_all(stdout_fd, msg.as_bytes())?;
+                return Ok(());
+            }
+        }
+
+        let editor = std::env::var("EDITOR")
+            .or_else(|_| std::env::var("VISUAL"))
+            .unwrap_or_else(|_| "vi".to_string());
+
+        if let Some(ref termios) = self.original_termios {
+            let _ = tcsetattr(io::stdin(), SetArg::TCSANOW, termios);
+        }
+
+        let msg = format!(
+            "\r\n\x1b[7m--- Opening {} in {} ---\x1b[0m\r\n",
+            config_path.display(),
+            editor
+        );
+        write_all(stdout_fd, msg.as_bytes())?;
+
+        let status = Command::new(&editor)
+            .arg(&config_path)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status();
+
+        let mut raw = match self.original_termios.as_ref() {
+            Some(t) => t.clone(),
+            None => tcgetattr(io::stdin()).context("tcgetattr failed after editor")?,
+        };
+        cfmakeraw(&mut raw);
+        tcsetattr(io::stdin(), SetArg::TCSANOW, &raw).context("tcsetattr failed after editor")?;
+
+        match status {
+            Ok(exit_status) if exit_status.success() => {
+                let new_config = Config::load();
+                self.apply_config_update(&new_config);
+                let msg = "\r\n\x1b[32mConfig reloaded\x1b[0m\r\n";
+                write_all(stdout_fd, msg.as_bytes())?;
+            }
+            Ok(exit_status) => {
+                let msg = format!(
+                    "\r\n\x1b[33mEditor exited with status: {}\x1b[0m\r\n",
+                    exit_status
+                );
+                write_all(stdout_fd, msg.as_bytes())?;
+            }
+            Err(e) => {
+                let msg = format!(
+                    "\r\n\x1b[31mFailed to run editor '{}': {}\x1b[0m\r\n",
+                    editor, e
+                );
+                write_all(stdout_fd, msg.as_bytes())?;
+            }
+        }
+
+        self.redraw_current_output(stdout_fd)?;
+        Ok(())
+    }
+
+    fn apply_config_update(&mut self, new_config: &crate::config::Config) {
+        use crate::key_parser;
+
+        self.config.max_output_lines = new_config.max_lines;
+        let throttle_ms = new_config.redraw_throttle_ms();
+        self.config.redraw_throttle_ms = throttle_ms;
+        self.redraw_throttler = RedrawThrottler::new(throttle_ms);
+
+        self.config.lookback_key = new_config.lookback_key.clone();
+        self.config.lookback_sequence = key_parser::parse(&new_config.lookback_key)
+            .map(|k| k.to_escape_sequence())
+            .unwrap_or_else(|_| new_config.lookback_sequence());
+
+        self.config.edit_config_key = new_config.edit_config_key.clone();
+        self.config.edit_config_sequence = key_parser::parse(&new_config.edit_config_key)
+            .map(|k| k.to_escape_sequence())
+            .unwrap_or_else(|_| new_config.edit_config_sequence());
+    }
+
+    fn redraw_current_output<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        self.forward_winsize()?;
+
+        self.output_buffer.clear();
+        self.history.append_all(&mut self.output_buffer);
+        write_all(stdout_fd, CLEAR_SCREEN)?;
+        write_all(stdout_fd, CLEAR_SCROLLBACK)?;
+        write_all(stdout_fd, CURSOR_HOME)?;
+        write_all(stdout_fd, &self.output_buffer)?;
         Ok(())
     }
 

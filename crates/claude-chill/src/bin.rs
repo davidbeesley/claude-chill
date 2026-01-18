@@ -22,8 +22,18 @@ fn main() -> ExitCode {
         Ok(key) => key.to_escape_sequence(),
         Err(e) => {
             eprintln!("Invalid lookback key '{}': {}", lookback_key, e);
-            eprintln!("Using default: [ctrl][shift][j]");
+            eprintln!("Using default: [ctrl][6]");
             config.lookback_sequence()
+        }
+    };
+
+    let edit_config_key = config.edit_config_key.clone();
+    let edit_config_sequence = match key_parser::parse(&edit_config_key) {
+        Ok(key) => key.to_escape_sequence(),
+        Err(e) => {
+            eprintln!("Invalid edit_config key '{}': {}", edit_config_key, e);
+            eprintln!("Using default: [ctrl][7]");
+            config.edit_config_sequence()
         }
     };
 
@@ -32,7 +42,9 @@ fn main() -> ExitCode {
         max_history_lines: history_lines,
         lookback_key,
         lookback_sequence,
-        redraw_throttle_ms: config.redraw_throttle_ms,
+        edit_config_key,
+        edit_config_sequence,
+        redraw_throttle_ms: config.redraw_throttle_ms(),
     };
 
     let cmd_args: Vec<&str> = cli.args.iter().map(|s| s.as_str()).collect();
