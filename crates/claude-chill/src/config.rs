@@ -11,6 +11,7 @@ pub struct Config {
     pub max_lines: usize,
     pub history_lines: usize,
     pub lookback_key: String,
+    pub auto_lookback_timeout_ms: u64,
 }
 
 impl Default for Config {
@@ -19,6 +20,7 @@ impl Default for Config {
             max_lines: 100,
             history_lines: 100_000,
             lookback_key: DEFAULT_LOOKBACK_KEY.to_string(),
+            auto_lookback_timeout_ms: 1000,
         }
     }
 }
@@ -90,6 +92,7 @@ mod tests {
         assert_eq!(config.max_lines, 100);
         assert_eq!(config.history_lines, 100_000);
         assert_eq!(config.lookback_key, "[ctrl][6]");
+        assert_eq!(config.auto_lookback_timeout_ms, 1000);
     }
 
     #[test]

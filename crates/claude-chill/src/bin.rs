@@ -18,6 +18,10 @@ fn main() -> ExitCode {
         .clone()
         .unwrap_or_else(|| config.lookback_key.clone());
 
+    let auto_lookback_timeout_ms = cli
+        .auto_lookback_timeout
+        .unwrap_or(config.auto_lookback_timeout_ms);
+
     let lookback_sequence = match key_parser::parse(&lookback_key) {
         Ok(key) => key.to_escape_sequence(),
         Err(e) => {
@@ -32,6 +36,7 @@ fn main() -> ExitCode {
         max_history_lines: history_lines,
         lookback_key,
         lookback_sequence,
+        auto_lookback_timeout_ms,
     };
 
     let cmd_args: Vec<&str> = cli.args.iter().map(|s| s.as_str()).collect();

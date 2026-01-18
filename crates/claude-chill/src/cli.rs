@@ -17,7 +17,8 @@ use clap::Parser;
                   Create ~/.config/claude-chill.toml:\n\n    \
                   max_lines = 100        # Lines shown per sync block\n    \
                   history_lines = 100000 # Lines stored for lookback\n    \
-                  lookback_key = \"[ctrl][shift][j]\"\n\n\
+                  lookback_key = \"[ctrl][shift][j]\"\n    \
+                  auto_lookback_timeout_ms = 1000  # Auto lookback after idle (ms)\n\n\
                   KEY FORMAT: [modifier][key]\n    \
                   Modifiers: [ctrl], [shift], [alt]\n    \
                   Keys: [a]-[z], [f1]-[f12], [pageup], [enter], [space], etc."
@@ -56,4 +57,11 @@ pub struct Cli {
         value_name = "KEY"
     )]
     pub lookback_key: Option<String>,
+
+    #[arg(
+        long = "auto-lookback-timeout",
+        help = "Auto lookback timeout in milliseconds (0 to disable)",
+        value_name = "MILLISECONDS"
+    )]
+    pub auto_lookback_timeout: Option<u64>,
 }

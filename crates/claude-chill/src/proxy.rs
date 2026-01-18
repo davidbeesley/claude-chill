@@ -18,6 +18,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
@@ -40,6 +41,7 @@ pub struct ProxyConfig {
     pub max_history_lines: usize,
     pub lookback_key: String,
     pub lookback_sequence: Vec<u8>,
+    pub auto_lookback_timeout_ms: u64,
 }
 
 impl Default for ProxyConfig {
@@ -49,6 +51,7 @@ impl Default for ProxyConfig {
             max_history_lines: 100_000,
             lookback_key: "[ctrl][6]".to_string(),
             lookback_sequence: vec![0x1E],
+            auto_lookback_timeout_ms: 1000,
         }
     }
 }
@@ -89,6 +92,9 @@ pub struct Proxy {
     lookback_cache: Vec<u8>,
     input_buffer: Vec<u8>,
     output_buffer: Vec<u8>,
+    last_sync_block_end: Option<Instant>,
+    auto_lookback_mode: bool,
+    idle_timeout: Duration,
     sync_start_finder: memmem::Finder<'static>,
     sync_end_finder: memmem::Finder<'static>,
     clear_screen_finder: memmem::Finder<'static>,
@@ -140,6 +146,8 @@ impl Proxy {
         drop(pty.slave);
         set_nonblocking(&pty.master)?;
 
+        let idle_timeout = Duration::from_millis(config.auto_lookback_timeout_ms);
+
         Ok(Self {
             history: LineBuffer::new(config.max_history_lines),
             config,
@@ -153,6 +161,9 @@ impl Proxy {
             lookback_cache: Vec::new(),
             input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
             output_buffer: Vec::with_capacity(OUTPUT_BUFFER_CAPACITY),
+            last_sync_block_end: None,
+            auto_lookback_mode: false,
+            idle_timeout,
             sync_start_finder: memmem::Finder::new(SYNC_START),
             sync_end_finder: memmem::Finder::new(SYNC_END),
             clear_screen_finder: memmem::Finder::new(CLEAR_SCREEN),
@@ -190,7 +201,23 @@ impl Proxy {
             ];
 
             match poll(&mut poll_fds, PollTimeout::from(100u16)) {
-                Ok(0) => continue,
+                Ok(0) => {
+                    // Check if we should enter auto lookback mode
+                    if let Some(end_time) = self.last_sync_block_end {
+                        if !self.idle_timeout.is_zero()
+                            && end_time.elapsed() >= self.idle_timeout
+                            && !self.in_sync_block
+                            && !self.in_lookback_mode
+                            && !self.auto_lookback_mode
+                            && !self.in_alternate_screen
+                        {
+                            self.show_full_history(&stdout_fd)?;
+                            self.auto_lookback_mode = true;
+                            self.last_sync_block_end = None;
+                        }
+                    }
+                    continue;
+                }
                 Ok(_) => {}
                 Err(Errno::EINTR) => continue,
                 Err(e) => anyhow::bail!("poll failed: {}", e),
@@ -231,6 +258,10 @@ impl Proxy {
     }
 
     fn process_output<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
+        if self.auto_lookback_mode {
+            self.auto_lookback_mode = false;
+        }
+
         if self.in_alternate_screen {
             return self.process_output_alt_screen(data, stdout_fd);
         }
@@ -265,6 +296,7 @@ impl Proxy {
                     self.sync_buffer.extend_from_slice(SYNC_END);
                     self.flush_sync_block(stdout_fd)?;
                     self.in_sync_block = false;
+                    self.last_sync_block_end = Some(Instant::now());
                     pos += idx + SYNC_END.len();
                 } else {
                     self.sync_buffer.extend_from_slice(&data[pos..]);
@@ -274,6 +306,13 @@ impl Proxy {
                 if idx > 0 {
                     write_all(stdout_fd, &data[pos..pos + idx])?;
                 }
+                self.last_sync_block_end = None;
+
+                if self.auto_lookback_mode {
+                    self.show_truncated_history(stdout_fd)?;
+                    self.auto_lookback_mode = false;
+                }
+
                 self.in_sync_block = true;
                 self.sync_buffer.clear();
                 self.sync_buffer.extend_from_slice(SYNC_START);
@@ -445,6 +484,32 @@ impl Proxy {
 
         write_all(stdout_fd, CLEAR_SCREEN)?;
         write_all(stdout_fd, CURSOR_HOME)?;
+        write_all(stdout_fd, &self.output_buffer)?;
+
+        Ok(())
+    }
+
+    fn show_full_history<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        self.output_buffer.clear();
+        self.history.append_all(&mut self.output_buffer);
+
+        write_all(stdout_fd, CLEAR_SCREEN)?;
+        write_all(stdout_fd, CURSOR_HOME)?;
+        write_all(stdout_fd, &self.output_buffer)?;
+
+        Ok(())
+    }
+
+    fn show_truncated_history<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        self.output_buffer.clear();
+        self.output_buffer.extend_from_slice(SYNC_START);
+        self.output_buffer.extend_from_slice(CLEAR_SCREEN);
+        self.output_buffer.extend_from_slice(CLEAR_SCROLLBACK);
+        self.output_buffer.extend_from_slice(CURSOR_HOME);
+        self.history
+            .append_last_n_lines(self.config.max_output_lines, &mut self.output_buffer);
+        self.output_buffer.extend_from_slice(SYNC_END);
+
         write_all(stdout_fd, &self.output_buffer)?;
 
         Ok(())
