@@ -4,6 +4,7 @@ use crate::escape_sequences::{
     SYNC_BUFFER_CAPACITY, SYNC_END, SYNC_START,
 };
 use crate::line_buffer::LineBuffer;
+use crate::redraw_throttler::RedrawThrottler;
 use anyhow::{Context, Result};
 use memchr::memmem;
 use nix::errno::Errno;
@@ -40,6 +41,7 @@ pub struct ProxyConfig {
     pub max_history_lines: usize,
     pub lookback_key: String,
     pub lookback_sequence: Vec<u8>,
+    pub redraw_throttle_ms: u64,
 }
 
 impl Default for ProxyConfig {
@@ -49,6 +51,7 @@ impl Default for ProxyConfig {
             max_history_lines: 100_000,
             lookback_key: "[ctrl][6]".to_string(),
             lookback_sequence: vec![0x1E],
+            redraw_throttle_ms: 50,
         }
     }
 }
@@ -89,6 +92,7 @@ pub struct Proxy {
     lookback_cache: Vec<u8>,
     input_buffer: Vec<u8>,
     output_buffer: Vec<u8>,
+    redraw_throttler: RedrawThrottler,
     sync_start_finder: memmem::Finder<'static>,
     sync_end_finder: memmem::Finder<'static>,
     clear_screen_finder: memmem::Finder<'static>,
@@ -140,6 +144,8 @@ impl Proxy {
         drop(pty.slave);
         set_nonblocking(&pty.master)?;
 
+        let redraw_throttler = RedrawThrottler::new(config.redraw_throttle_ms);
+
         Ok(Self {
             history: LineBuffer::new(config.max_history_lines),
             config,
@@ -153,6 +159,7 @@ impl Proxy {
             lookback_cache: Vec::new(),
             input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
             output_buffer: Vec::with_capacity(OUTPUT_BUFFER_CAPACITY),
+            redraw_throttler,
             sync_start_finder: memmem::Finder::new(SYNC_START),
             sync_end_finder: memmem::Finder::new(SYNC_END),
             clear_screen_finder: memmem::Finder::new(CLEAR_SCREEN),
@@ -189,12 +196,23 @@ impl Proxy {
                 PollFd::new(stdin_borrowed, PollFlags::POLLIN),
             ];
 
-            match poll(&mut poll_fds, PollTimeout::from(100u16)) {
-                Ok(0) => continue,
+            let poll_timeout_ms = self
+                .redraw_throttler
+                .time_until_next_flush()
+                .map(|d| d.as_millis().min(100) as u16)
+                .unwrap_or(100);
+
+            match poll(&mut poll_fds, PollTimeout::from(poll_timeout_ms)) {
+                Ok(0) => {
+                    self.flush_pending_redraw(&stdout_fd)?;
+                    continue;
+                }
                 Ok(_) => {}
                 Err(Errno::EINTR) => continue,
                 Err(e) => anyhow::bail!("poll failed: {}", e),
             }
+
+            self.flush_pending_redraw(&stdout_fd)?;
 
             if let Some(revents) = poll_fds[0].revents() {
                 if revents.contains(PollFlags::POLLIN) {
@@ -348,12 +366,20 @@ impl Proxy {
 
         if is_full_redraw {
             self.create_truncated_output();
-            write_all(stdout_fd, &self.output_buffer)?;
+            self.redraw_throttler.submit(self.output_buffer.clone());
+            self.flush_pending_redraw(stdout_fd)?;
         } else {
             write_all(stdout_fd, &self.sync_buffer)?;
         }
 
         self.sync_buffer.clear();
+        Ok(())
+    }
+
+    fn flush_pending_redraw<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        if let Some(data) = self.redraw_throttler.take_pending() {
+            write_all(stdout_fd, &data)?;
+        }
         Ok(())
     }
 

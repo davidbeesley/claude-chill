@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         max_history_lines: history_lines,
         lookback_key,
         lookback_sequence,
+        redraw_throttle_ms: config.redraw_throttle_ms,
     };
 
     let cmd_args: Vec<&str> = cli.args.iter().map(|s| s.as_str()).collect();

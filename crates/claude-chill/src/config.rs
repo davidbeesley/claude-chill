@@ -4,6 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 const DEFAULT_LOOKBACK_KEY: &str = "[ctrl][6]";
+const DEFAULT_REDRAW_THROTTLE_MS: u64 = 50;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -11,6 +12,7 @@ pub struct Config {
     pub max_lines: usize,
     pub history_lines: usize,
     pub lookback_key: String,
+    pub redraw_throttle_ms: u64,
 }
 
 impl Default for Config {
@@ -19,6 +21,7 @@ impl Default for Config {
             max_lines: 100,
             history_lines: 100_000,
             lookback_key: DEFAULT_LOOKBACK_KEY.to_string(),
+            redraw_throttle_ms: DEFAULT_REDRAW_THROTTLE_MS,
         }
     }
 }
@@ -90,6 +93,7 @@ mod tests {
         assert_eq!(config.max_lines, 100);
         assert_eq!(config.history_lines, 100_000);
         assert_eq!(config.lookback_key, "[ctrl][6]");
+        assert_eq!(config.redraw_throttle_ms, 50);
     }
 
     #[test]
