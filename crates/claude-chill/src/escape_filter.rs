@@ -324,10 +324,10 @@ fn is_device_status_query(pending: &[u8]) -> bool {
     let param_slice = &pending[param_start..param_end];
 
     // Parse the parameter
-    if let Ok(param_str) = std::str::from_utf8(param_slice) {
-        if let Ok(param) = param_str.parse::<u32>() {
-            return param == 5 || param == 6;
-        }
+    if let Ok(param_str) = std::str::from_utf8(param_slice)
+        && let Ok(param) = param_str.parse::<u32>()
+    {
+        return param == 5 || param == 6;
     }
 
     false

@@ -206,7 +206,15 @@ if {$vi_cmd eq ""} {
 
     # Start vi/vim with no config to avoid user rc issues
     send "$vi_cmd -u NONE\r"
-    sleep 1
+
+    # Wait for alt screen sequence before sending input
+    # This ensures vim has fully started and alt screen is active
+    # Note: \033 is octal for ESC, \[ escapes the bracket in TCL
+    expect {
+        -re "\033\\\[\\?1049h" { }
+        timeout { fail "$vi_cmd did not enter alt screen" }
+    }
+    sleep 0.3
 
     # In vi, Ctrl+^ switches between buffers - should NOT trigger lookback
     send "\x1e"
