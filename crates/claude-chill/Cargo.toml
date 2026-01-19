@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 default-run = "claude-chill"
-description = "PTY proxy that reduces terminal flicker by truncating synchronized output"
+description = "PTY proxy that reduces terminal flicker using VT-based rendering"
 license = "MIT"
 repository = "https://github.com/davidbeesley/claude-chill"
 

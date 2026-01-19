@@ -45,23 +45,17 @@ extern "C" fn handle_sigterm(_: libc::c_int) {
 }
 
 pub struct ProxyConfig {
-    pub max_output_lines: usize,
     pub max_history_lines: usize,
     pub lookback_key: String,
     pub lookback_sequence: Vec<u8>,
-    pub edit_config_key: String,
-    pub edit_config_sequence: Vec<u8>,
 }
 
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
-            max_output_lines: 100,
             max_history_lines: 100_000,
             lookback_key: "[ctrl][6]".to_string(),
             lookback_sequence: vec![0x1E],
-            edit_config_key: "[ctrl][7]".to_string(),
-            edit_config_sequence: vec![0x1F],
         }
     }
 }
@@ -108,7 +102,6 @@ pub struct Proxy {
     vt_render_pending: bool,
     lookback_cache: Vec<u8>,
     lookback_input_buffer: Vec<u8>,
-    edit_config_input_buffer: Vec<u8>,
     output_buffer: Vec<u8>,
     sync_start_finder: memmem::Finder<'static>,
     sync_end_finder: memmem::Finder<'static>,
@@ -186,7 +179,6 @@ impl Proxy {
             vt_render_pending: false,
             lookback_cache: Vec::new(),
             lookback_input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
-            edit_config_input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
             output_buffer: Vec::with_capacity(OUTPUT_BUFFER_CAPACITY),
             sync_start_finder: memmem::Finder::new(SYNC_START),
             sync_end_finder: memmem::Finder::new(SYNC_END),
@@ -570,7 +562,6 @@ impl Proxy {
         for &byte in data {
             if self.in_lookback_mode && byte == 0x03 {
                 self.lookback_input_buffer.clear();
-                self.edit_config_input_buffer.clear();
                 self.exit_lookback_mode(stdout_fd)?;
                 continue;
             }
@@ -580,29 +571,17 @@ impl Proxy {
                 &mut self.lookback_input_buffer.clone(),
                 &self.config.lookback_sequence.clone(),
             );
-            let edit_config_action = self.check_sequence_match(
-                byte,
-                &mut self.edit_config_input_buffer.clone(),
-                &self.config.edit_config_sequence.clone(),
-            );
 
             self.lookback_input_buffer.push(byte);
-            self.edit_config_input_buffer.push(byte);
 
             if self.lookback_input_buffer.len() > self.config.lookback_sequence.len() {
                 let excess = self.lookback_input_buffer.len() - self.config.lookback_sequence.len();
                 self.lookback_input_buffer.drain(..excess);
             }
-            if self.edit_config_input_buffer.len() > self.config.edit_config_sequence.len() {
-                let excess =
-                    self.edit_config_input_buffer.len() - self.config.edit_config_sequence.len();
-                self.edit_config_input_buffer.drain(..excess);
-            }
 
             match lookback_action {
                 SequenceMatch::Complete => {
                     self.lookback_input_buffer.clear();
-                    self.edit_config_input_buffer.clear();
                     if self.in_lookback_mode {
                         self.exit_lookback_mode(stdout_fd)?;
                     } else {
@@ -622,31 +601,7 @@ impl Proxy {
                 }
             }
 
-            match edit_config_action {
-                SequenceMatch::Complete => {
-                    self.lookback_input_buffer.clear();
-                    self.edit_config_input_buffer.clear();
-                    if !self.in_lookback_mode {
-                        self.open_config_editor(stdout_fd)?;
-                    }
-                    continue;
-                }
-                SequenceMatch::Partial => {}
-                SequenceMatch::None => {
-                    if !self
-                        .config
-                        .edit_config_sequence
-                        .starts_with(&self.edit_config_input_buffer)
-                    {
-                        self.edit_config_input_buffer.clear();
-                    }
-                }
-            }
-
-            if lookback_action == SequenceMatch::None
-                && edit_config_action == SequenceMatch::None
-                && !self.in_lookback_mode
-            {
+            if lookback_action == SequenceMatch::None && !self.in_lookback_mode {
                 write_all(&self.pty_master, &[byte])?;
             }
         }
@@ -733,121 +688,6 @@ impl Proxy {
         self.render_vt_screen(stdout_fd)?;
 
         Ok(())
-    }
-
-    fn open_config_editor<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
-        debug!("open_config_editor: starting");
-        use crate::config::Config;
-
-        let config_path = match Config::config_path() {
-            Some(path) => path,
-            None => {
-                debug!("open_config_editor: no config path");
-                let msg = "\r\n\x1b[33mCould not determine config path\x1b[0m\r\n";
-                write_all(stdout_fd, msg.as_bytes())?;
-                return Ok(());
-            }
-        };
-
-        if !config_path.exists() {
-            if let Some(parent) = config_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let default_config = r#"# claude-chill configuration
-max_lines = 100
-history_lines = 100000
-lookback_key = "[ctrl][6]"
-edit_config_key = "[ctrl][7]"
-
-# Refreshes per second
-refresh_rate = 20
-"#;
-            if let Err(e) = std::fs::write(&config_path, default_config) {
-                let msg = format!("\r\n\x1b[33mFailed to create config file: {}\x1b[0m\r\n", e);
-                write_all(stdout_fd, msg.as_bytes())?;
-                return Ok(());
-            }
-        }
-
-        let editor = std::env::var("EDITOR")
-            .or_else(|_| std::env::var("VISUAL"))
-            .unwrap_or_else(|_| "vi".to_string());
-
-        if let Some(ref termios) = self.original_termios {
-            let _ = tcsetattr(io::stdin(), SetArg::TCSANOW, termios);
-        }
-
-        let msg = format!(
-            "\r\n\x1b[7m--- Opening {} in {} ---\x1b[0m\r\n",
-            config_path.display(),
-            editor
-        );
-        write_all(stdout_fd, msg.as_bytes())?;
-
-        let status = Command::new(&editor)
-            .arg(&config_path)
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .status();
-
-        let mut raw = match self.original_termios.as_ref() {
-            Some(t) => t.clone(),
-            None => tcgetattr(io::stdin()).context("tcgetattr failed after editor")?,
-        };
-        cfmakeraw(&mut raw);
-        tcsetattr(io::stdin(), SetArg::TCSANOW, &raw).context("tcsetattr failed after editor")?;
-
-        match status {
-            Ok(exit_status) if exit_status.success() => {
-                debug!("open_config_editor: editor success, reloading config");
-                let new_config = Config::load();
-                self.apply_config_update(&new_config);
-                let msg = "\r\n\x1b[32mConfig reloaded\x1b[0m\r\n";
-                write_all(stdout_fd, msg.as_bytes())?;
-            }
-            Ok(exit_status) => {
-                debug!("open_config_editor: editor exit status={}", exit_status);
-                let msg = format!(
-                    "\r\n\x1b[33mEditor exited with status: {}\x1b[0m\r\n",
-                    exit_status
-                );
-                write_all(stdout_fd, msg.as_bytes())?;
-            }
-            Err(e) => {
-                debug!("open_config_editor: editor error={}", e);
-                let msg = format!(
-                    "\r\n\x1b[31mFailed to run editor '{}': {}\x1b[0m\r\n",
-                    editor, e
-                );
-                write_all(stdout_fd, msg.as_bytes())?;
-            }
-        }
-
-        debug!("open_config_editor: calling redraw_current_output");
-        self.redraw_current_output(stdout_fd)?;
-        Ok(())
-    }
-
-    fn apply_config_update(&mut self, new_config: &crate::config::Config) {
-        use crate::key_parser;
-
-        self.config.max_output_lines = new_config.max_lines;
-
-        self.config.lookback_key = new_config.lookback_key.clone();
-        self.config.lookback_sequence = key_parser::parse(&new_config.lookback_key)
-            .map(|k| k.to_escape_sequence())
-            .unwrap_or_else(|_| new_config.lookback_sequence());
-
-        self.config.edit_config_key = new_config.edit_config_key.clone();
-        self.config.edit_config_sequence = key_parser::parse(&new_config.edit_config_key)
-            .map(|k| k.to_escape_sequence())
-            .unwrap_or_else(|_| new_config.edit_config_sequence());
-    }
-
-    fn redraw_current_output<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
-        self.forward_winsize()?;
-        self.render_vt_screen(stdout_fd)
     }
 
     fn forward_winsize(&mut self) -> Result<()> {

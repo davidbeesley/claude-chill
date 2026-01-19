@@ -26,7 +26,6 @@ fn main() -> ExitCode {
     let cli = cli::Cli::parse();
     let config = Config::load();
 
-    let max_lines = cli.max_lines.unwrap_or(config.max_lines);
     let history_lines = cli.history_lines.unwrap_or(config.history_lines);
 
     let lookback_key = cli
@@ -43,23 +42,10 @@ fn main() -> ExitCode {
         }
     };
 
-    let edit_config_key = config.edit_config_key.clone();
-    let edit_config_sequence = match key_parser::parse(&edit_config_key) {
-        Ok(key) => key.to_escape_sequence(),
-        Err(e) => {
-            eprintln!("Invalid edit_config key '{}': {}", edit_config_key, e);
-            eprintln!("Using default: [ctrl][7]");
-            config.edit_config_sequence()
-        }
-    };
-
     let proxy_config = ProxyConfig {
-        max_output_lines: max_lines,
         max_history_lines: history_lines,
         lookback_key,
         lookback_sequence,
-        edit_config_key,
-        edit_config_sequence,
     };
 
     let cmd_args: Vec<&str> = cli.args.iter().map(|s| s.as_str()).collect();
