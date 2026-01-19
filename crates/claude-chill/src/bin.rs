@@ -42,10 +42,15 @@ fn main() -> ExitCode {
         }
     };
 
+    let auto_lookback_timeout_ms = cli
+        .auto_lookback_timeout
+        .unwrap_or(config.auto_lookback_timeout_ms);
+
     let proxy_config = ProxyConfig {
         max_history_lines: history_lines,
         lookback_key,
         lookback_sequence,
+        auto_lookback_timeout_ms,
     };
 
     let cmd_args: Vec<&str> = cli.args.iter().map(|s| s.as_str()).collect();

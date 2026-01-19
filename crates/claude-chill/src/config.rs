@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 const DEFAULT_LOOKBACK_KEY: &str = "[ctrl][6]";
 const DEFAULT_REFRESH_RATE: u64 = 20;
+const DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS: u64 = 5000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -12,6 +13,7 @@ pub struct Config {
     pub history_lines: usize,
     pub lookback_key: String,
     pub refresh_rate: u64,
+    pub auto_lookback_timeout_ms: u64,
 }
 
 impl Default for Config {
@@ -20,6 +22,7 @@ impl Default for Config {
             history_lines: 100_000,
             lookback_key: DEFAULT_LOOKBACK_KEY.to_string(),
             refresh_rate: DEFAULT_REFRESH_RATE,
+            auto_lookback_timeout_ms: DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS,
         }
     }
 }
@@ -97,6 +100,7 @@ mod tests {
         assert_eq!(config.lookback_key, "[ctrl][6]");
         assert_eq!(config.refresh_rate, 20);
         assert_eq!(config.redraw_throttle_ms(), 50);
+        assert_eq!(config.auto_lookback_timeout_ms, 5000);
     }
 
     #[test]
