@@ -37,6 +37,53 @@ claude-chill claude
 claude-chill -- claude --verbose   # Use -- for command flags
 ```
 
+### Command Line Help
+
+```
+$ claude-chill --help
+A PTY proxy that tames Claude Code's massive terminal updates
+
+Usage: claude-chill [OPTIONS] <COMMAND> [ARGS]...
+
+Arguments:
+  <COMMAND>  Command to run (e.g., "claude")
+  [ARGS]...  Arguments to pass to the command
+
+Options:
+  -H, --history <HISTORY_LINES>
+          Max lines stored for lookback (default: 100000)
+  -k, --lookback-key <LOOKBACK_KEY>
+          Key to toggle lookback mode (default: "[ctrl][6]")
+  -a, --auto-lookback-timeout <AUTO_LOOKBACK_TIMEOUT>
+          Auto-lookback timeout in ms, 0 to disable (default: 5000)
+  -h, --help
+          Print help
+  -V, --version
+          Print version
+```
+
+### Examples
+
+```bash
+# Basic usage
+claude-chill claude
+
+# Pass arguments to claude
+claude-chill -- claude --verbose
+
+# Custom history size
+claude-chill -H 50000 claude
+
+# Custom lookback key
+claude-chill -k "[f12]" claude
+
+# Disable auto-lookback (see below)
+claude-chill -a 0 claude
+
+# Combine options with claude arguments
+claude-chill -H 50000 -a 0 -- claude --verbose
+```
+
 ## Lookback Mode
 
 Press `Ctrl+6` (or your configured key) to enter lookback mode:
@@ -48,15 +95,49 @@ Press `Ctrl+6` (or your configured key) to enter lookback mode:
 
 When you exit lookback mode, any cached output is processed and the current state is displayed.
 
-**Auto-lookback**: After 5 seconds of idle (no new renders), the full history is automatically displayed so you can scroll back without pressing any keys.
+## Auto-Lookback
+
+After 5 seconds of idle (no new renders), the full history is automatically dumped to your terminal so you can scroll back without pressing any keys. This is useful for reviewing Claude's output after it finishes working.
+
+**Note:** The auto-lookback causes a brief screen flicker during the transition as it clears the screen and writes the history buffer. If this is distracting, you can disable it.
+
+### Disabling Auto-Lookback
+
+**Via command line:**
+```bash
+claude-chill -a 0 claude
+# or
+claude-chill --auto-lookback-timeout 0 claude
+```
+
+**Via config file** (`~/.config/claude-chill.toml`):
+```toml
+auto_lookback_timeout_ms = 0
+```
+
+### Adjusting the Timeout
+
+You can change the idle timeout before auto-lookback triggers:
+
+```bash
+# Trigger after 10 seconds of idle
+claude-chill -a 10000 claude
+```
+
+Or in the config file:
+```toml
+auto_lookback_timeout_ms = 10000  # 10 seconds
+```
 
 ## Configuration
 
 Create `~/.config/claude-chill.toml`:
 
 ```toml
-history_lines = 100000 # Max lines stored for lookback
-lookback_key = "[ctrl][6]"
+history_lines = 100000          # Max lines stored for lookback
+lookback_key = "[ctrl][6]"      # Key to toggle lookback mode
+refresh_rate = 20               # Rendering FPS
+auto_lookback_timeout_ms = 5000 # Auto-lookback after 5s idle (0 to disable)
 ```
 
 Note: History is cleared on full screen redraws, so lookback shows output since Claude's last full render.
