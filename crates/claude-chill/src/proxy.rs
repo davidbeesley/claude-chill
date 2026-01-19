@@ -4,44 +4,22 @@ use crate::escape_sequences::{
     SYNC_END, SYNC_START,
 };
 use crate::line_buffer::LineBuffer;
+use crate::platform::{self, PlatformSignal, PollResult, Pty, RawModeGuard};
 use anyhow::{Context, Result};
 use log::debug;
 use memchr::memmem;
-use nix::errno::Errno;
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use nix::pty::{Winsize, openpty};
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, sigaction};
-use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
-use nix::unistd::{Pid, isatty, read, write};
-use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, ExitStatus};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
-static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
-static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+use crate::platform::OriginalTerminalState;
+#[cfg(windows)]
+use crate::platform::OriginalTerminalState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SequenceMatch {
     Complete,
     Partial,
     None,
-}
-
-extern "C" fn handle_sigwinch(_: libc::c_int) {
-    SIGWINCH_RECEIVED.store(true, Ordering::SeqCst);
-}
-
-extern "C" fn handle_sigint(_: libc::c_int) {
-    SIGINT_RECEIVED.store(true, Ordering::SeqCst);
-}
-
-extern "C" fn handle_sigterm(_: libc::c_int) {
-    SIGTERM_RECEIVED.store(true, Ordering::SeqCst);
 }
 
 pub struct ProxyConfig {
@@ -62,37 +40,13 @@ impl Default for ProxyConfig {
     }
 }
 
-struct TerminalGuard {
-    original_termios: Option<Termios>,
-}
-
-impl TerminalGuard {
-    fn new() -> Result<Self> {
-        let original_termios = setup_raw_mode()?;
-        Ok(Self { original_termios })
-    }
-
-    fn take(mut self) -> Option<Termios> {
-        self.original_termios.take()
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        if let Some(ref termios) = self.original_termios {
-            let _ = tcsetattr(io::stdin(), SetArg::TCSANOW, termios);
-        }
-    }
-}
-
 const RENDER_DELAY_MS: u64 = 5;
 const SYNC_BLOCK_DELAY_MS: u64 = 50;
 
 pub struct Proxy {
     config: ProxyConfig,
-    pty_master: OwnedFd,
-    child: Child,
-    original_termios: Option<Termios>,
+    pty: Pty,
+    original_terminal_state: Option<OriginalTerminalState>,
     history: LineBuffer,
     vt_parser: vt100::Parser,
     vt_prev_screen: Option<vt100::Screen>,
@@ -119,46 +73,14 @@ pub struct Proxy {
 
 impl Proxy {
     pub fn spawn(command: &str, args: &[&str], config: ProxyConfig) -> Result<Self> {
-        let winsize = get_terminal_size()?;
-        let pty = openpty(&winsize, None).context("openpty failed")?;
+        let term_size = platform::get_terminal_size()?;
 
-        let terminal_guard = TerminalGuard::new()?;
-        setup_signal_handlers()?;
+        let raw_mode_guard = RawModeGuard::new()?;
+        platform::setup_signal_handlers()?;
 
-        let slave_fd = pty.slave.as_raw_fd();
+        let pty = Pty::spawn(command, args, term_size).context("PTY spawn failed")?;
 
-        let child = unsafe {
-            Command::new(command)
-                .args(args)
-                .pre_exec(move || {
-                    if libc::setsid() == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::dup2(slave_fd, 0) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::dup2(slave_fd, 1) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::dup2(slave_fd, 2) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if slave_fd > 2 {
-                        libc::close(slave_fd);
-                    }
-                    Ok(())
-                })
-                .spawn()
-                .context("spawn failed")?
-        };
-
-        drop(pty.slave);
-        set_nonblocking(&pty.master)?;
-
-        let vt_parser = vt100::Parser::new(winsize.ws_row, winsize.ws_col, 0);
+        let vt_parser = vt100::Parser::new(term_size.rows, term_size.cols, 0);
 
         // Seed history with clear screen so replay starts fresh
         let mut history = LineBuffer::new(config.max_history_lines);
@@ -172,9 +94,8 @@ impl Proxy {
         Ok(Self {
             history,
             config,
-            pty_master: pty.master,
-            child,
-            original_termios: terminal_guard.take(),
+            pty,
+            original_terminal_state: raw_mode_guard.take(),
             vt_parser,
             vt_prev_screen: None,
             last_output_time: None,
@@ -200,93 +121,103 @@ impl Proxy {
     }
 
     pub fn run(&mut self) -> Result<i32> {
-        let stdin_fd = io::stdin();
-        let stdout_fd = io::stdout();
-
         let mut buf = [0u8; 65536];
 
         loop {
-            if SIGWINCH_RECEIVED.swap(false, Ordering::SeqCst) {
-                self.forward_winsize()?;
+            // Check for platform signals
+            for signal in platform::check_signals() {
+                match signal {
+                    PlatformSignal::Resize => {
+                        self.forward_winsize()?;
+                    }
+                    PlatformSignal::Interrupt => {
+                        self.pty.signal(PlatformSignal::Interrupt);
+                    }
+                    PlatformSignal::Terminate => {
+                        self.pty.signal(PlatformSignal::Terminate);
+                    }
+                }
             }
-            if SIGINT_RECEIVED.swap(false, Ordering::SeqCst) {
-                self.forward_signal(Signal::SIGINT);
-            }
-            if SIGTERM_RECEIVED.swap(false, Ordering::SeqCst) {
-                self.forward_signal(Signal::SIGTERM);
-            }
-
-            let master_fd = unsafe { BorrowedFd::borrow_raw(self.pty_master.as_raw_fd()) };
-            let stdin_borrowed = unsafe { BorrowedFd::borrow_raw(stdin_fd.as_raw_fd()) };
-
-            let mut poll_fds = [
-                PollFd::new(master_fd, PollFlags::POLLIN),
-                PollFd::new(stdin_borrowed, PollFlags::POLLIN),
-            ];
 
             let poll_timeout_ms = self
                 .time_until_render()
                 .map(|d| d.as_millis().min(100) as u16)
                 .unwrap_or(100);
 
-            match poll(&mut poll_fds, PollTimeout::from(poll_timeout_ms)) {
-                Ok(0) => {
-                    self.flush_pending_vt_render(&stdout_fd)?;
-                    self.check_auto_lookback(&stdout_fd)?;
+            #[cfg(unix)]
+            let poll_result = platform::poll_io(self.pty.as_raw_fd(), poll_timeout_ms)?;
+            #[cfg(windows)]
+            let poll_result = platform::poll_io(&self.pty, poll_timeout_ms)?;
+
+            match poll_result {
+                PollResult::Timeout => {
+                    self.flush_pending_vt_render()?;
+                    self.check_auto_lookback()?;
                     continue;
                 }
-                Ok(_) => {}
-                Err(Errno::EINTR) => continue,
-                Err(e) => anyhow::bail!("poll failed: {}", e),
-            }
-
-            self.flush_pending_vt_render(&stdout_fd)?;
-
-            if let Some(revents) = poll_fds[0].revents() {
-                if revents.contains(PollFlags::POLLIN) {
-                    match nix_read(&self.pty_master, &mut buf) {
+                PollResult::Interrupted => continue,
+                PollResult::PtyHangup => break,
+                PollResult::PtyReadable => {
+                    self.flush_pending_vt_render()?;
+                    match self.pty.read(&mut buf) {
                         Ok(0) => break,
-                        Ok(n) => self.process_output(&buf[..n], &stdout_fd)?,
-                        Err(Errno::EAGAIN) => {}
-                        Err(Errno::EIO) => break,
+                        Ok(n) => self.process_output(&buf[..n])?,
+                        #[cfg(unix)]
+                        Err(nix::errno::Errno::EAGAIN) => {}
+                        #[cfg(unix)]
+                        Err(nix::errno::Errno::EIO) => break,
+                        #[cfg(windows)]
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => anyhow::bail!("read from pty failed: {}", e),
                     }
                 }
-                if revents.contains(PollFlags::POLLHUP) {
-                    break;
+                PollResult::StdinReadable => {
+                    self.flush_pending_vt_render()?;
+                    match platform::read_stdin(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => self.process_input(&buf[..n])?,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => anyhow::bail!("read from stdin failed: {}", e),
+                    }
                 }
-            }
-
-            if let Some(revents) = poll_fds[1].revents()
-                && revents.contains(PollFlags::POLLIN)
-            {
-                match nix_read(&stdin_fd, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => self.process_input(&buf[..n], &stdout_fd)?,
-                    Err(Errno::EAGAIN) => {}
-                    Err(e) => anyhow::bail!("read from stdin failed: {}", e),
+                PollResult::BothReadable => {
+                    self.flush_pending_vt_render()?;
+                    // Handle PTY first
+                    match self.pty.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => self.process_output(&buf[..n])?,
+                        #[cfg(unix)]
+                        Err(nix::errno::Errno::EAGAIN) => {}
+                        #[cfg(unix)]
+                        Err(nix::errno::Errno::EIO) => break,
+                        #[cfg(windows)]
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => anyhow::bail!("read from pty failed: {}", e),
+                    }
+                    // Then handle stdin
+                    match platform::read_stdin(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => self.process_input(&buf[..n])?,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => anyhow::bail!("read from stdin failed: {}", e),
+                    }
                 }
             }
         }
 
         // Final render before exit
         if self.vt_render_pending {
-            self.render_vt_screen(&stdout_fd)?;
+            self.render_vt_screen()?;
         }
 
-        self.wait_child()
+        self.pty.wait()
     }
 
-    fn process_output<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
-        self.process_output_inner(data, stdout_fd, true)
+    fn process_output(&mut self, data: &[u8]) -> Result<()> {
+        self.process_output_inner(data, true)
     }
 
-    fn process_output_inner<F: AsFd>(
-        &mut self,
-        data: &[u8],
-        stdout_fd: &F,
-        feed_vt: bool,
-    ) -> Result<()> {
+    fn process_output_inner(&mut self, data: &[u8], feed_vt: bool) -> Result<()> {
         debug!(
             "process_output: len={} in_alt={} in_lookback={} feed_vt={}",
             data.len(),
@@ -301,7 +232,7 @@ impl Proxy {
                 self.vt_parser.process(data);
                 self.history.push_bytes(data);
             }
-            return self.process_output_alt_screen(data, stdout_fd);
+            return self.process_output_alt_screen(data);
         }
 
         if self.in_lookback_mode {
@@ -339,8 +270,8 @@ impl Proxy {
                 self.in_alternate_screen = true;
                 let seq_len = self.alt_screen_enter_len(&data[pos + alt_pos..]);
                 // Write alt screen enter directly
-                write_all(stdout_fd, &data[pos + alt_pos..pos + alt_pos + seq_len])?;
-                return self.process_output_alt_screen(&data[pos + alt_pos + seq_len..], stdout_fd);
+                platform::write_stdout(&data[pos + alt_pos..pos + alt_pos + seq_len])?;
+                return self.process_output_alt_screen(&data[pos + alt_pos + seq_len..]);
             }
 
             if self.in_sync_block {
@@ -375,21 +306,21 @@ impl Proxy {
         Ok(())
     }
 
-    fn process_output_alt_screen<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
+    fn process_output_alt_screen(&mut self, data: &[u8]) -> Result<()> {
         if let Some(exit_pos) = self.find_alt_screen_exit(data) {
             debug!(
                 "process_output_alt_screen: ALT_SCREEN_EXIT detected at pos={}",
                 exit_pos
             );
-            write_all(stdout_fd, &data[..exit_pos])?;
+            platform::write_stdout(&data[..exit_pos])?;
             let seq_len = self.alt_screen_exit_len(&data[exit_pos..]);
-            write_all(stdout_fd, &data[exit_pos..exit_pos + seq_len])?;
+            platform::write_stdout(&data[exit_pos..exit_pos + seq_len])?;
             self.in_alternate_screen = false;
 
             // Force full VT render to restore main screen content
             debug!("process_output_alt_screen: rendering VT screen after alt exit");
             self.vt_prev_screen = None;
-            self.render_vt_screen(stdout_fd)?;
+            self.render_vt_screen()?;
 
             // Data after ALT_EXIT was already fed to VT and history when we processed
             // the alt screen chunk, so we just need to check for more alt screen transitions
@@ -398,16 +329,16 @@ impl Proxy {
                 // Check if there's another alt screen enter in the remaining data
                 if self.find_alt_screen_enter(remaining).is_some() {
                     // Need to process for alt screen detection, but skip VT/history feed
-                    return self.process_output_check_alt_only(remaining, stdout_fd);
+                    return self.process_output_check_alt_only(remaining);
                 }
             }
             return Ok(());
         }
-        write_all(stdout_fd, data)
+        platform::write_stdout(data)
     }
 
     /// Check for alt screen transitions without re-feeding VT/history
-    fn process_output_check_alt_only<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
+    fn process_output_check_alt_only(&mut self, data: &[u8]) -> Result<()> {
         if let Some(alt_pos) = self.find_alt_screen_enter(data) {
             debug!(
                 "process_output_check_alt_only: ALT_SCREEN_ENTER at pos={}",
@@ -415,8 +346,8 @@ impl Proxy {
             );
             self.in_alternate_screen = true;
             let seq_len = self.alt_screen_enter_len(&data[alt_pos..]);
-            write_all(stdout_fd, &data[alt_pos..alt_pos + seq_len])?;
-            return self.process_output_alt_screen(&data[alt_pos + seq_len..], stdout_fd);
+            platform::write_stdout(&data[alt_pos..alt_pos + seq_len])?;
+            return self.process_output_alt_screen(&data[alt_pos + seq_len..]);
         }
         Ok(())
     }
@@ -481,7 +412,7 @@ impl Proxy {
         self.sync_buffer.clear();
     }
 
-    fn flush_pending_vt_render<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+    fn flush_pending_vt_render(&mut self) -> Result<()> {
         if !self.vt_render_pending || self.in_lookback_mode || self.in_alternate_screen {
             return Ok(());
         }
@@ -499,7 +430,7 @@ impl Proxy {
         };
 
         if elapsed >= delay {
-            self.render_vt_screen(stdout_fd)?;
+            self.render_vt_screen()?;
         }
 
         Ok(())
@@ -528,7 +459,7 @@ impl Proxy {
         }
     }
 
-    fn render_vt_screen<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+    fn render_vt_screen(&mut self) -> Result<()> {
         let is_diff = self.vt_prev_screen.is_some();
         self.output_buffer.clear();
         self.output_buffer.extend_from_slice(SYNC_START);
@@ -555,7 +486,7 @@ impl Proxy {
             is_diff,
             self.output_buffer.len()
         );
-        write_all(stdout_fd, &self.output_buffer)?;
+        platform::write_stdout(&self.output_buffer)?;
 
         // Store current screen for next diff
         self.vt_prev_screen = Some(self.vt_parser.screen().clone());
@@ -564,7 +495,7 @@ impl Proxy {
         Ok(())
     }
 
-    fn check_auto_lookback<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+    fn check_auto_lookback(&mut self) -> Result<()> {
         if self.auto_lookback_timeout.is_zero() {
             return Ok(());
         }
@@ -577,12 +508,12 @@ impl Proxy {
         if render_time.elapsed() < self.auto_lookback_timeout {
             return Ok(());
         }
-        self.dump_history(stdout_fd)?;
+        self.dump_history()?;
         self.last_render_time = None;
         Ok(())
     }
 
-    fn dump_history<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+    fn dump_history(&mut self) -> Result<()> {
         debug!(
             "dump_history: history_bytes={} lines={}",
             self.history.total_bytes(),
@@ -591,24 +522,24 @@ impl Proxy {
         self.output_buffer.clear();
         self.history.append_all(&mut self.output_buffer);
 
-        write_all(stdout_fd, CLEAR_SCREEN)?;
-        write_all(stdout_fd, CURSOR_HOME)?;
-        write_all(stdout_fd, &self.output_buffer)?;
+        platform::write_stdout(CLEAR_SCREEN)?;
+        platform::write_stdout(CURSOR_HOME)?;
+        platform::write_stdout(&self.output_buffer)?;
 
         // Force full VT render on next output since terminal now shows history
         self.vt_prev_screen = None;
         Ok(())
     }
 
-    fn process_input<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
+    fn process_input(&mut self, data: &[u8]) -> Result<()> {
         if self.in_alternate_screen {
-            return write_all(&self.pty_master, data);
+            return self.pty.write(data);
         }
 
         for &byte in data {
             if self.in_lookback_mode && byte == 0x03 {
                 self.lookback_input_buffer.clear();
-                self.exit_lookback_mode(stdout_fd)?;
+                self.exit_lookback_mode()?;
                 continue;
             }
 
@@ -629,7 +560,7 @@ impl Proxy {
                 SequenceMatch::Complete => {
                     self.lookback_input_buffer.clear();
                     if self.in_lookback_mode {
-                        self.exit_lookback_mode(stdout_fd)?;
+                        self.exit_lookback_mode()?;
                     } else {
                         self.enter_lookback_mode()?;
                     }
@@ -648,7 +579,7 @@ impl Proxy {
             }
 
             if lookback_action == SequenceMatch::None && !self.in_lookback_mode {
-                write_all(&self.pty_master, &[byte])?;
+                self.pty.write(&[byte])?;
             }
         }
         Ok(())
@@ -691,21 +622,20 @@ impl Proxy {
             self.output_buffer.len()
         );
 
-        let stdout_fd = io::stdout();
-        write_all(&stdout_fd, CLEAR_SCREEN)?;
-        write_all(&stdout_fd, CURSOR_HOME)?;
-        write_all(&stdout_fd, &self.output_buffer)?;
+        platform::write_stdout(CLEAR_SCREEN)?;
+        platform::write_stdout(CURSOR_HOME)?;
+        platform::write_stdout(&self.output_buffer)?;
 
         let exit_msg = format!(
             "\r\n\x1b[7m--- LOOKBACK MODE: press {} or Ctrl+C to exit ---\x1b[0m\r\n",
             self.config.lookback_key
         );
-        write_all(&stdout_fd, exit_msg.as_bytes())?;
+        platform::write_stdout(exit_msg.as_bytes())?;
 
         Ok(())
     }
 
-    fn exit_lookback_mode<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+    fn exit_lookback_mode(&mut self) -> Result<()> {
         debug!(
             "exit_lookback_mode: cached_len={}",
             self.lookback_cache.len()
@@ -719,7 +649,7 @@ impl Proxy {
                 "exit_lookback_mode: processing {} cached bytes",
                 cached.len()
             );
-            self.process_output(&cached, stdout_fd)?;
+            self.process_output(&cached)?;
         }
 
         // Reset sync block state
@@ -731,133 +661,34 @@ impl Proxy {
         // Force full render since terminal was showing history
         debug!("exit_lookback_mode: rendering VT screen");
         self.vt_prev_screen = None;
-        self.render_vt_screen(stdout_fd)?;
+        self.render_vt_screen()?;
 
         Ok(())
     }
 
     fn forward_winsize(&mut self) -> Result<()> {
-        if let Ok(winsize) = get_terminal_size() {
+        if let Ok(term_size) = platform::get_terminal_size() {
             debug!(
                 "forward_winsize: rows={} cols={}",
-                winsize.ws_row, winsize.ws_col
+                term_size.rows, term_size.cols
             );
             // Resize VT emulator
             self.vt_parser
                 .screen_mut()
-                .set_size(winsize.ws_row, winsize.ws_col);
+                .set_size(term_size.rows, term_size.cols);
             // Force full render on next frame since size changed
             self.vt_prev_screen = None;
             // Forward to child process
-            unsafe {
-                libc::ioctl(
-                    self.pty_master.as_raw_fd(),
-                    libc::TIOCSWINSZ as libc::c_ulong,
-                    &winsize,
-                );
-            }
+            self.pty.set_size(term_size)?;
         }
         Ok(())
-    }
-
-    fn forward_signal(&self, signal: Signal) {
-        let pid = Pid::from_raw(self.child.id() as i32);
-        let _ = kill(pid, signal);
-    }
-
-    fn wait_child(&mut self) -> Result<i32> {
-        match self.child.wait() {
-            Ok(status) => Ok(exit_code_from_status(status)),
-            Err(e) => anyhow::bail!("wait failed: {}", e),
-        }
     }
 }
 
 impl Drop for Proxy {
     fn drop(&mut self) {
-        if let Some(ref termios) = self.original_termios {
-            let _ = tcsetattr(io::stdin(), SetArg::TCSANOW, termios);
+        if let Some(ref state) = self.original_terminal_state {
+            platform::restore_terminal(state);
         }
     }
-}
-
-fn get_terminal_size() -> Result<Winsize> {
-    let mut ws: Winsize = unsafe { std::mem::zeroed() };
-    let ret = unsafe {
-        libc::ioctl(
-            io::stdout().as_raw_fd(),
-            libc::TIOCGWINSZ as libc::c_ulong,
-            &mut ws,
-        )
-    };
-    if ret == -1 || ws.ws_row == 0 || ws.ws_col == 0 {
-        ws.ws_row = 24;
-        ws.ws_col = 80;
-    }
-    Ok(ws)
-}
-
-fn exit_code_from_status(status: ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt;
-    if let Some(code) = status.code() {
-        code
-    } else if let Some(signal) = status.signal() {
-        128 + signal
-    } else {
-        1
-    }
-}
-
-fn setup_raw_mode() -> Result<Option<Termios>> {
-    let stdin = io::stdin();
-    if !isatty(&stdin).unwrap_or(false) {
-        return Ok(None);
-    }
-
-    let original = tcgetattr(&stdin).context("tcgetattr failed")?;
-    let mut raw = original.clone();
-    cfmakeraw(&mut raw);
-    tcsetattr(&stdin, SetArg::TCSANOW, &raw).context("tcsetattr failed")?;
-    Ok(Some(original))
-}
-
-fn setup_signal_handler(signal: Signal, handler: extern "C" fn(libc::c_int)) -> Result<()> {
-    let action = SigAction::new(
-        SigHandler::Handler(handler),
-        SaFlags::SA_RESTART,
-        SigSet::empty(),
-    );
-    unsafe { sigaction(signal, &action) }.context(format!("sigaction {:?} failed", signal))?;
-    Ok(())
-}
-
-fn setup_signal_handlers() -> Result<()> {
-    setup_signal_handler(Signal::SIGWINCH, handle_sigwinch)?;
-    setup_signal_handler(Signal::SIGINT, handle_sigint)?;
-    setup_signal_handler(Signal::SIGTERM, handle_sigterm)?;
-    Ok(())
-}
-
-fn set_nonblocking<Fd: AsFd>(fd: &Fd) -> Result<()> {
-    let flags = fcntl(fd.as_fd(), FcntlArg::F_GETFL).context("fcntl F_GETFL failed")?;
-    let flags = OFlag::from_bits_truncate(flags);
-    fcntl(fd.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
-        .context("fcntl F_SETFL failed")?;
-    Ok(())
-}
-
-fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
-    let mut written = 0;
-    while written < data.len() {
-        match write(fd, &data[written..]) {
-            Ok(n) => written += n,
-            Err(Errno::EAGAIN) | Err(Errno::EINTR) => continue,
-            Err(e) => anyhow::bail!("write failed: {}", e),
-        }
-    }
-    Ok(())
-}
-
-fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
-    read(fd.as_fd(), buf)
 }

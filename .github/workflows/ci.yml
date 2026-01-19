@@ -20,6 +20,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo check --all-targets
 
+  check-windows:
+    name: Check (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --all-targets
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -40,10 +48,20 @@ jobs:
           components: clippy
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  clippy-windows:
+    name: Clippy (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
   test-matrix:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -61,8 +79,8 @@ jobs:
             exit 1
           fi
 
-  integration:
-    name: Integration Tests
+  integration-unix:
+    name: Integration Tests (Unix)
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -78,3 +96,14 @@ jobs:
         run: command -v expect || brew install expect
       - run: cargo build
       - run: expect tests/integration.exp
+
+  integration-windows:
+    name: Integration Tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build
+      - name: Run PowerShell integration tests
+        shell: pwsh
+        run: .\tests\integration.ps1
