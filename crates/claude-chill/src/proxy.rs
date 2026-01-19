@@ -547,6 +547,13 @@ impl Proxy {
             self.process_output(&cached, stdout_fd)?;
         }
 
+        // Reset sync block state - any partial sync block from cached output would
+        // cause subsequent output to be buffered indefinitely, making the display
+        // appear frozen. Since we're doing a full redraw and forward_winsize will
+        // trigger the child to redraw, any lost partial content will be resent.
+        self.in_sync_block = false;
+        self.sync_buffer.clear();
+
         self.forward_winsize()?;
 
         self.output_buffer.clear();
