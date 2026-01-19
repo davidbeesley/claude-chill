@@ -7,6 +7,22 @@ use claude_chill::proxy::{Proxy, ProxyConfig};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // Only enable logging if CLAUDE_CHILL_LOG_FILE is set
+    if let Ok(log_file) = std::env::var("CLAUDE_CHILL_LOG_FILE") {
+        use std::fs::OpenOptions;
+        if let Ok(file) = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_file)
+        {
+            env_logger::Builder::new()
+                .filter_level(log::LevelFilter::Debug)
+                .target(env_logger::Target::Pipe(Box::new(file)))
+                .init();
+        }
+    }
+
     let cli = cli::Cli::parse();
     let config = Config::load();
 
@@ -44,7 +60,6 @@ fn main() -> ExitCode {
         lookback_sequence,
         edit_config_key,
         edit_config_sequence,
-        redraw_throttle_ms: config.redraw_throttle_ms(),
     };
 
     let cmd_args: Vec<&str> = cli.args.iter().map(|s| s.as_str()).collect();

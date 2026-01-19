@@ -58,4 +58,29 @@ impl RedrawThrottler {
     pub fn has_pending(&self) -> bool {
         self.pending_redraw.is_some()
     }
+
+    pub fn can_render(&self) -> bool {
+        match self.last_flush {
+            None => true,
+            Some(last) => last.elapsed() >= self.min_interval,
+        }
+    }
+
+    pub fn mark_rendered(&mut self) {
+        self.last_flush = Some(Instant::now());
+    }
+
+    pub fn time_until_can_render(&self) -> Option<Duration> {
+        match self.last_flush {
+            None => Some(Duration::ZERO),
+            Some(last) => {
+                let elapsed = last.elapsed();
+                if elapsed >= self.min_interval {
+                    Some(Duration::ZERO)
+                } else {
+                    Some(self.min_interval - elapsed)
+                }
+            }
+        }
+    }
 }

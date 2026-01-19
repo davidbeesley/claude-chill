@@ -1,11 +1,11 @@
 use crate::escape_sequences::{
     ALT_SCREEN_ENTER, ALT_SCREEN_ENTER_LEGACY, ALT_SCREEN_EXIT, ALT_SCREEN_EXIT_LEGACY,
-    CLEAR_SCREEN, CLEAR_SCROLLBACK, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY,
-    SYNC_BUFFER_CAPACITY, SYNC_END, SYNC_START,
+    CLEAR_SCREEN, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY, SYNC_BUFFER_CAPACITY,
+    SYNC_END, SYNC_START,
 };
 use crate::line_buffer::LineBuffer;
-use crate::redraw_throttler::RedrawThrottler;
 use anyhow::{Context, Result};
+use log::debug;
 use memchr::memmem;
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -19,6 +19,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
@@ -50,7 +51,6 @@ pub struct ProxyConfig {
     pub lookback_sequence: Vec<u8>,
     pub edit_config_key: String,
     pub edit_config_sequence: Vec<u8>,
-    pub redraw_throttle_ms: u64,
 }
 
 impl Default for ProxyConfig {
@@ -62,7 +62,6 @@ impl Default for ProxyConfig {
             lookback_sequence: vec![0x1E],
             edit_config_key: "[ctrl][7]".to_string(),
             edit_config_sequence: vec![0x1F],
-            redraw_throttle_ms: 50,
         }
     }
 }
@@ -90,21 +89,27 @@ impl Drop for TerminalGuard {
     }
 }
 
+const RENDER_DELAY_MS: u64 = 5;
+const SYNC_BLOCK_DELAY_MS: u64 = 50;
+
 pub struct Proxy {
     config: ProxyConfig,
     pty_master: OwnedFd,
     child: Child,
     original_termios: Option<Termios>,
     history: LineBuffer,
+    vt_parser: vt100::Parser,
+    vt_prev_screen: Option<vt100::Screen>,
+    last_output_time: Option<Instant>,
     sync_buffer: Vec<u8>,
     in_sync_block: bool,
     in_lookback_mode: bool,
     in_alternate_screen: bool,
+    vt_render_pending: bool,
     lookback_cache: Vec<u8>,
     lookback_input_buffer: Vec<u8>,
     edit_config_input_buffer: Vec<u8>,
     output_buffer: Vec<u8>,
-    redraw_throttler: RedrawThrottler,
     sync_start_finder: memmem::Finder<'static>,
     sync_end_finder: memmem::Finder<'static>,
     clear_screen_finder: memmem::Finder<'static>,
@@ -156,23 +161,33 @@ impl Proxy {
         drop(pty.slave);
         set_nonblocking(&pty.master)?;
 
-        let redraw_throttler = RedrawThrottler::new(config.redraw_throttle_ms);
+        let vt_parser = vt100::Parser::new(winsize.ws_row, winsize.ws_col, 0);
+
+        // Seed history with clear screen so replay starts fresh
+        let mut history = LineBuffer::new(config.max_history_lines);
+        history.push_bytes(CLEAR_SCREEN);
+        history.push_bytes(CURSOR_HOME);
+
+        debug!("Proxy::spawn: command={} args={:?}", command, args);
 
         Ok(Self {
-            history: LineBuffer::new(config.max_history_lines),
+            history,
             config,
             pty_master: pty.master,
             child,
             original_termios: terminal_guard.take(),
+            vt_parser,
+            vt_prev_screen: None,
+            last_output_time: None,
             sync_buffer: Vec::with_capacity(SYNC_BUFFER_CAPACITY),
             in_sync_block: false,
             in_lookback_mode: false,
             in_alternate_screen: false,
+            vt_render_pending: false,
             lookback_cache: Vec::new(),
             lookback_input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
             edit_config_input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
             output_buffer: Vec::with_capacity(OUTPUT_BUFFER_CAPACITY),
-            redraw_throttler,
             sync_start_finder: memmem::Finder::new(SYNC_START),
             sync_end_finder: memmem::Finder::new(SYNC_END),
             clear_screen_finder: memmem::Finder::new(CLEAR_SCREEN),
@@ -210,14 +225,13 @@ impl Proxy {
             ];
 
             let poll_timeout_ms = self
-                .redraw_throttler
-                .time_until_next_flush()
+                .time_until_render()
                 .map(|d| d.as_millis().min(100) as u16)
                 .unwrap_or(100);
 
             match poll(&mut poll_fds, PollTimeout::from(poll_timeout_ms)) {
                 Ok(0) => {
-                    self.flush_pending_redraw(&stdout_fd)?;
+                    self.flush_pending_vt_render(&stdout_fd)?;
                     continue;
                 }
                 Ok(_) => {}
@@ -225,7 +239,7 @@ impl Proxy {
                 Err(e) => anyhow::bail!("poll failed: {}", e),
             }
 
-            self.flush_pending_redraw(&stdout_fd)?;
+            self.flush_pending_vt_render(&stdout_fd)?;
 
             if let Some(revents) = poll_fds[0].revents() {
                 if revents.contains(PollFlags::POLLIN) {
@@ -254,47 +268,86 @@ impl Proxy {
             }
         }
 
-        if !self.sync_buffer.is_empty() {
-            write_all(&stdout_fd, &self.sync_buffer)?;
+        // Final render before exit
+        if self.vt_render_pending {
+            self.render_vt_screen(&stdout_fd)?;
         }
 
         self.wait_child()
     }
 
     fn process_output<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
+        self.process_output_inner(data, stdout_fd, true)
+    }
+
+    fn process_output_inner<F: AsFd>(
+        &mut self,
+        data: &[u8],
+        stdout_fd: &F,
+        feed_vt: bool,
+    ) -> Result<()> {
+        debug!(
+            "process_output: len={} in_alt={} in_lookback={} feed_vt={}",
+            data.len(),
+            self.in_alternate_screen,
+            self.in_lookback_mode,
+            feed_vt
+        );
+
         if self.in_alternate_screen {
+            // Still feed VT and history while in alt screen so they stay in sync
+            if feed_vt {
+                self.vt_parser.process(data);
+                self.history.push_bytes(data);
+            }
             return self.process_output_alt_screen(data, stdout_fd);
         }
 
         if self.in_lookback_mode {
+            debug!("process_output: caching {} bytes for lookback", data.len());
             self.lookback_cache.extend_from_slice(data);
             return Ok(());
         }
 
-        let mut pos = 0;
+        // Feed data to VT emulator (unless already fed by caller)
+        if feed_vt {
+            self.vt_parser.process(data);
+        }
+        self.vt_render_pending = true;
+        self.last_output_time = Some(Instant::now());
 
+        // Process sync blocks for history management
+        let mut pos = 0;
         while pos < data.len() {
+            // Check for alt screen enter
             if let Some(alt_pos) = self.find_alt_screen_enter(&data[pos..]) {
+                debug!(
+                    "process_output: ALT_SCREEN_ENTER detected at pos={}",
+                    pos + alt_pos
+                );
+                // Add ALL remaining data to history (including alt screen enter and content)
+                // This ensures history matches VT exactly
+                let remaining = &data[pos..];
                 if self.in_sync_block {
-                    self.sync_buffer
-                        .extend_from_slice(&data[pos..pos + alt_pos]);
-                    write_all(stdout_fd, &self.sync_buffer)?;
-                    self.sync_buffer.clear();
+                    self.sync_buffer.extend_from_slice(remaining);
+                    self.flush_sync_block_to_history();
                     self.in_sync_block = false;
-                } else if alt_pos > 0 {
-                    write_all(stdout_fd, &data[pos..pos + alt_pos])?;
+                } else {
+                    self.history.push_bytes(remaining);
                 }
                 self.in_alternate_screen = true;
                 let seq_len = self.alt_screen_enter_len(&data[pos + alt_pos..]);
+                // Write alt screen enter directly
                 write_all(stdout_fd, &data[pos + alt_pos..pos + alt_pos + seq_len])?;
                 return self.process_output_alt_screen(&data[pos + alt_pos + seq_len..], stdout_fd);
             }
 
             if self.in_sync_block {
                 if let Some(idx) = self.sync_end_finder.find(&data[pos..]) {
+                    debug!("process_output: SYNC_END at pos={}", pos + idx);
                     self.sync_buffer.extend_from_slice(&data[pos..pos + idx]);
                     self.sync_buffer.extend_from_slice(SYNC_END);
-                    self.flush_sync_block(stdout_fd)?;
+                    self.flush_sync_block_to_history();
                     self.in_sync_block = false;
                     pos += idx + SYNC_END.len();
                 } else {
@@ -302,15 +355,18 @@ impl Proxy {
                     break;
                 }
             } else if let Some(idx) = self.sync_start_finder.find(&data[pos..]) {
+                debug!("process_output: SYNC_START at pos={}", pos + idx);
+                // Add any data before SYNC_START to history
                 if idx > 0 {
-                    write_all(stdout_fd, &data[pos..pos + idx])?;
+                    self.history.push_bytes(&data[pos..pos + idx]);
                 }
                 self.in_sync_block = true;
                 self.sync_buffer.clear();
                 self.sync_buffer.extend_from_slice(SYNC_START);
                 pos += idx + SYNC_START.len();
             } else {
-                write_all(stdout_fd, &data[pos..])?;
+                // No sync block, just add to history
+                self.history.push_bytes(&data[pos..]);
                 break;
             }
         }
@@ -320,13 +376,48 @@ impl Proxy {
 
     fn process_output_alt_screen<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
         if let Some(exit_pos) = self.find_alt_screen_exit(data) {
+            debug!(
+                "process_output_alt_screen: ALT_SCREEN_EXIT detected at pos={}",
+                exit_pos
+            );
             write_all(stdout_fd, &data[..exit_pos])?;
             let seq_len = self.alt_screen_exit_len(&data[exit_pos..]);
             write_all(stdout_fd, &data[exit_pos..exit_pos + seq_len])?;
             self.in_alternate_screen = false;
-            return self.process_output(&data[exit_pos + seq_len..], stdout_fd);
+
+            // Force full VT render to restore main screen content
+            debug!("process_output_alt_screen: rendering VT screen after alt exit");
+            self.vt_prev_screen = None;
+            self.render_vt_screen(stdout_fd)?;
+
+            // Data after ALT_EXIT was already fed to VT and history when we processed
+            // the alt screen chunk, so we just need to check for more alt screen transitions
+            let remaining = &data[exit_pos + seq_len..];
+            if !remaining.is_empty() {
+                // Check if there's another alt screen enter in the remaining data
+                if self.find_alt_screen_enter(remaining).is_some() {
+                    // Need to process for alt screen detection, but skip VT/history feed
+                    return self.process_output_check_alt_only(remaining, stdout_fd);
+                }
+            }
+            return Ok(());
         }
         write_all(stdout_fd, data)
+    }
+
+    /// Check for alt screen transitions without re-feeding VT/history
+    fn process_output_check_alt_only<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
+        if let Some(alt_pos) = self.find_alt_screen_enter(data) {
+            debug!(
+                "process_output_check_alt_only: ALT_SCREEN_ENTER at pos={}",
+                alt_pos
+            );
+            self.in_alternate_screen = true;
+            let seq_len = self.alt_screen_enter_len(&data[alt_pos..]);
+            write_all(stdout_fd, &data[alt_pos..alt_pos + seq_len])?;
+            return self.process_output_alt_screen(&data[alt_pos + seq_len..], stdout_fd);
+        }
+        Ok(())
     }
 
     fn find_alt_screen_enter(&self, data: &[u8]) -> Option<usize> {
@@ -367,44 +458,108 @@ impl Proxy {
         }
     }
 
-    fn flush_sync_block<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+    fn flush_sync_block_to_history(&mut self) {
         let has_clear_screen = self.clear_screen_finder.find(&self.sync_buffer).is_some();
         let has_cursor_home = self.cursor_home_finder.find(&self.sync_buffer).is_some();
         let is_full_redraw = has_clear_screen && has_cursor_home;
 
+        debug!(
+            "flush_sync_block: len={} full_redraw={}",
+            self.sync_buffer.len(),
+            is_full_redraw
+        );
+
         if is_full_redraw {
+            debug!("CLEARING HISTORY");
             self.history.clear();
+            // Re-seed with clear screen after clearing
+            self.history.push_bytes(CLEAR_SCREEN);
+            self.history.push_bytes(CURSOR_HOME);
         }
         self.history.push_bytes(&self.sync_buffer);
-
-        if is_full_redraw {
-            self.create_truncated_output();
-            self.redraw_throttler.submit(self.output_buffer.clone());
-            self.flush_pending_redraw(stdout_fd)?;
-        } else {
-            write_all(stdout_fd, &self.sync_buffer)?;
-        }
-
         self.sync_buffer.clear();
-        Ok(())
     }
 
-    fn flush_pending_redraw<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
-        if let Some(data) = self.redraw_throttler.take_pending() {
-            write_all(stdout_fd, &data)?;
+    fn flush_pending_vt_render<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        if !self.vt_render_pending || self.in_lookback_mode || self.in_alternate_screen {
+            return Ok(());
         }
+
+        let elapsed = self
+            .last_output_time
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::MAX);
+
+        // Wait longer if in sync block (more data likely coming)
+        let delay = if self.in_sync_block {
+            Duration::from_millis(SYNC_BLOCK_DELAY_MS)
+        } else {
+            Duration::from_millis(RENDER_DELAY_MS)
+        };
+
+        if elapsed >= delay {
+            self.render_vt_screen(stdout_fd)?;
+        }
+
         Ok(())
     }
 
-    fn create_truncated_output(&mut self) {
+    fn time_until_render(&self) -> Option<Duration> {
+        if !self.vt_render_pending || self.in_lookback_mode || self.in_alternate_screen {
+            return None;
+        }
+
+        let elapsed = self
+            .last_output_time
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::MAX);
+
+        let delay = if self.in_sync_block {
+            Duration::from_millis(SYNC_BLOCK_DELAY_MS)
+        } else {
+            Duration::from_millis(RENDER_DELAY_MS)
+        };
+
+        if elapsed >= delay {
+            Some(Duration::ZERO)
+        } else {
+            Some(delay - elapsed)
+        }
+    }
+
+    fn render_vt_screen<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        let is_diff = self.vt_prev_screen.is_some();
         self.output_buffer.clear();
         self.output_buffer.extend_from_slice(SYNC_START);
-        self.output_buffer.extend_from_slice(CLEAR_SCREEN);
-        self.output_buffer.extend_from_slice(CLEAR_SCROLLBACK);
-        self.output_buffer.extend_from_slice(CURSOR_HOME);
-        self.history
-            .append_last_n_lines(self.config.max_output_lines, &mut self.output_buffer);
+
+        match &self.vt_prev_screen {
+            Some(prev) => {
+                // Diff-based render: only send changes
+                self.output_buffer
+                    .extend_from_slice(&self.vt_parser.screen().contents_diff(prev));
+            }
+            None => {
+                // First render: full screen
+                self.output_buffer
+                    .extend_from_slice(&self.vt_parser.screen().contents_formatted());
+            }
+        }
+
+        self.output_buffer
+            .extend_from_slice(&self.vt_parser.screen().cursor_state_formatted());
         self.output_buffer.extend_from_slice(SYNC_END);
+
+        debug!(
+            "render_vt_screen: diff={} output_len={}\n",
+            is_diff,
+            self.output_buffer.len()
+        );
+        write_all(stdout_fd, &self.output_buffer)?;
+
+        // Store current screen for next diff
+        self.vt_prev_screen = Some(self.vt_parser.screen().clone());
+        self.vt_render_pending = false;
+        Ok(())
     }
 
     fn process_input<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
@@ -519,11 +674,21 @@ impl Proxy {
     }
 
     fn enter_lookback_mode(&mut self) -> Result<()> {
+        debug!(
+            "enter_lookback_mode: history_bytes={} lines={}",
+            self.history.total_bytes(),
+            self.history.line_count()
+        );
         self.in_lookback_mode = true;
         self.lookback_cache.clear();
+        self.vt_render_pending = false;
 
         self.output_buffer.clear();
         self.history.append_all(&mut self.output_buffer);
+        debug!(
+            "enter_lookback_mode: output_buffer_len={}",
+            self.output_buffer.len()
+        );
 
         let stdout_fd = io::stdout();
         write_all(&stdout_fd, CLEAR_SCREEN)?;
@@ -540,39 +705,44 @@ impl Proxy {
     }
 
     fn exit_lookback_mode<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        debug!(
+            "exit_lookback_mode: cached_len={}",
+            self.lookback_cache.len()
+        );
         self.in_lookback_mode = false;
 
+        // Process cached output through VT to update screen state
         let cached = std::mem::take(&mut self.lookback_cache);
         if !cached.is_empty() {
+            debug!(
+                "exit_lookback_mode: processing {} cached bytes",
+                cached.len()
+            );
             self.process_output(&cached, stdout_fd)?;
         }
 
-        // Reset sync block state - any partial sync block from cached output would
-        // cause subsequent output to be buffered indefinitely, making the display
-        // appear frozen. Since we're doing a full redraw and forward_winsize will
-        // trigger the child to redraw, any lost partial content will be resent.
+        // Reset sync block state
         self.in_sync_block = false;
         self.sync_buffer.clear();
 
         self.forward_winsize()?;
 
-        self.output_buffer.clear();
-        self.history.append_all(&mut self.output_buffer);
-
-        write_all(stdout_fd, CLEAR_SCREEN)?;
-        write_all(stdout_fd, CLEAR_SCROLLBACK)?;
-        write_all(stdout_fd, CURSOR_HOME)?;
-        write_all(stdout_fd, &self.output_buffer)?;
+        // Force full render since terminal was showing history
+        debug!("exit_lookback_mode: rendering VT screen");
+        self.vt_prev_screen = None;
+        self.render_vt_screen(stdout_fd)?;
 
         Ok(())
     }
 
     fn open_config_editor<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        debug!("open_config_editor: starting");
         use crate::config::Config;
 
         let config_path = match Config::config_path() {
             Some(path) => path,
             None => {
+                debug!("open_config_editor: no config path");
                 let msg = "\r\n\x1b[33mCould not determine config path\x1b[0m\r\n";
                 write_all(stdout_fd, msg.as_bytes())?;
                 return Ok(());
@@ -630,12 +800,14 @@ refresh_rate = 20
 
         match status {
             Ok(exit_status) if exit_status.success() => {
+                debug!("open_config_editor: editor success, reloading config");
                 let new_config = Config::load();
                 self.apply_config_update(&new_config);
                 let msg = "\r\n\x1b[32mConfig reloaded\x1b[0m\r\n";
                 write_all(stdout_fd, msg.as_bytes())?;
             }
             Ok(exit_status) => {
+                debug!("open_config_editor: editor exit status={}", exit_status);
                 let msg = format!(
                     "\r\n\x1b[33mEditor exited with status: {}\x1b[0m\r\n",
                     exit_status
@@ -643,6 +815,7 @@ refresh_rate = 20
                 write_all(stdout_fd, msg.as_bytes())?;
             }
             Err(e) => {
+                debug!("open_config_editor: editor error={}", e);
                 let msg = format!(
                     "\r\n\x1b[31mFailed to run editor '{}': {}\x1b[0m\r\n",
                     editor, e
@@ -651,6 +824,7 @@ refresh_rate = 20
             }
         }
 
+        debug!("open_config_editor: calling redraw_current_output");
         self.redraw_current_output(stdout_fd)?;
         Ok(())
     }
@@ -659,9 +833,6 @@ refresh_rate = 20
         use crate::key_parser;
 
         self.config.max_output_lines = new_config.max_lines;
-        let throttle_ms = new_config.redraw_throttle_ms();
-        self.config.redraw_throttle_ms = throttle_ms;
-        self.redraw_throttler = RedrawThrottler::new(throttle_ms);
 
         self.config.lookback_key = new_config.lookback_key.clone();
         self.config.lookback_sequence = key_parser::parse(&new_config.lookback_key)
@@ -676,18 +847,22 @@ refresh_rate = 20
 
     fn redraw_current_output<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
         self.forward_winsize()?;
-
-        self.output_buffer.clear();
-        self.history.append_all(&mut self.output_buffer);
-        write_all(stdout_fd, CLEAR_SCREEN)?;
-        write_all(stdout_fd, CLEAR_SCROLLBACK)?;
-        write_all(stdout_fd, CURSOR_HOME)?;
-        write_all(stdout_fd, &self.output_buffer)?;
-        Ok(())
+        self.render_vt_screen(stdout_fd)
     }
 
-    fn forward_winsize(&self) -> Result<()> {
+    fn forward_winsize(&mut self) -> Result<()> {
         if let Ok(winsize) = get_terminal_size() {
+            debug!(
+                "forward_winsize: rows={} cols={}",
+                winsize.ws_row, winsize.ws_col
+            );
+            // Resize VT emulator
+            self.vt_parser
+                .screen_mut()
+                .set_size(winsize.ws_row, winsize.ws_col);
+            // Force full render on next frame since size changed
+            self.vt_prev_screen = None;
+            // Forward to child process
             unsafe {
                 libc::ioctl(
                     self.pty_master.as_raw_fd(),
