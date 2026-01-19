@@ -8,34 +8,27 @@
 use super::{PlatformSignal, PollResult, TerminalSize};
 use anyhow::{Context, Result};
 use std::io::{self, Read, Write};
-use std::mem::MaybeUninit;
-use std::process::ExitStatus;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::Duration;
 
 use windows::Win32::Foundation::{
-    BOOL, CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_FAILED, WAIT_OBJECT_0,
+    CloseHandle, BOOL, FALSE, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_FAILED, WAIT_OBJECT_0,
     WAIT_TIMEOUT,
 };
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{
-    CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, COORD, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+    ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, GetConsoleScreenBufferInfo,
+    GetStdHandle, ResizePseudoConsole, SetConsoleCtrlHandler, SetConsoleMode, CONSOLE_MODE,
+    CONSOLE_SCREEN_BUFFER_INFO, COORD, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
     ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, SetConsoleMode,
-};
-use windows::Win32::System::Console::{
-    ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
+    HPCON, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTUPINFOEXW,
+    CreateProcessW, GetExitCodeProcess, InitializeProcThreadAttributeList,
     UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW,
 };
 
 // Signal flags - set by console control handler, checked in main loop
@@ -82,8 +75,7 @@ impl Pty {
                 X: size.cols as i16,
                 Y: size.rows as i16,
             };
-            let mut hpc = HPCON::default();
-            CreatePseudoConsole(coord, pipe_pty_in, pipe_pty_out, 0, &mut hpc)
+            let hpc = CreatePseudoConsole(coord, pipe_pty_in, pipe_pty_out, 0)
                 .context("CreatePseudoConsole failed")?;
 
             // Close handles that the pseudoconsole now owns
@@ -122,7 +114,7 @@ impl Pty {
             startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
 
             // Build command line
-            let mut cmdline = if args.is_empty() {
+            let cmdline = if args.is_empty() {
                 command.to_string()
             } else {
                 format!("{} {}", command, args.join(" "))
