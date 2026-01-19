@@ -48,6 +48,7 @@ pub struct ProxyConfig {
     pub max_history_lines: usize,
     pub lookback_key: String,
     pub lookback_sequence: Vec<u8>,
+    pub auto_lookback_timeout_ms: u64,
 }
 
 impl Default for ProxyConfig {
@@ -56,6 +57,7 @@ impl Default for ProxyConfig {
             max_history_lines: 100_000,
             lookback_key: "[ctrl][6]".to_string(),
             lookback_sequence: vec![0x1E],
+            auto_lookback_timeout_ms: 5000,
         }
     }
 }
@@ -95,6 +97,8 @@ pub struct Proxy {
     vt_parser: vt100::Parser,
     vt_prev_screen: Option<vt100::Screen>,
     last_output_time: Option<Instant>,
+    last_render_time: Option<Instant>,
+    auto_lookback_timeout: Duration,
     sync_buffer: Vec<u8>,
     in_sync_block: bool,
     in_lookback_mode: bool,
@@ -161,6 +165,8 @@ impl Proxy {
         history.push_bytes(CLEAR_SCREEN);
         history.push_bytes(CURSOR_HOME);
 
+        let auto_lookback_timeout = Duration::from_millis(config.auto_lookback_timeout_ms);
+
         debug!("Proxy::spawn: command={} args={:?}", command, args);
 
         Ok(Self {
@@ -172,6 +178,8 @@ impl Proxy {
             vt_parser,
             vt_prev_screen: None,
             last_output_time: None,
+            last_render_time: None,
+            auto_lookback_timeout,
             sync_buffer: Vec::with_capacity(SYNC_BUFFER_CAPACITY),
             in_sync_block: false,
             in_lookback_mode: false,
@@ -224,6 +232,7 @@ impl Proxy {
             match poll(&mut poll_fds, PollTimeout::from(poll_timeout_ms)) {
                 Ok(0) => {
                     self.flush_pending_vt_render(&stdout_fd)?;
+                    self.check_auto_lookback(&stdout_fd)?;
                     continue;
                 }
                 Ok(_) => {}
@@ -551,6 +560,43 @@ impl Proxy {
         // Store current screen for next diff
         self.vt_prev_screen = Some(self.vt_parser.screen().clone());
         self.vt_render_pending = false;
+        self.last_render_time = Some(Instant::now());
+        Ok(())
+    }
+
+    fn check_auto_lookback<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        if self.auto_lookback_timeout.is_zero() {
+            return Ok(());
+        }
+        if self.in_lookback_mode || self.in_alternate_screen {
+            return Ok(());
+        }
+        let Some(render_time) = self.last_render_time else {
+            return Ok(());
+        };
+        if render_time.elapsed() < self.auto_lookback_timeout {
+            return Ok(());
+        }
+        self.dump_history(stdout_fd)?;
+        self.last_render_time = None;
+        Ok(())
+    }
+
+    fn dump_history<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        debug!(
+            "dump_history: history_bytes={} lines={}",
+            self.history.total_bytes(),
+            self.history.line_count()
+        );
+        self.output_buffer.clear();
+        self.history.append_all(&mut self.output_buffer);
+
+        write_all(stdout_fd, CLEAR_SCREEN)?;
+        write_all(stdout_fd, CURSOR_HOME)?;
+        write_all(stdout_fd, &self.output_buffer)?;
+
+        // Force full VT render on next output since terminal now shows history
+        self.vt_prev_screen = None;
         Ok(())
     }
 

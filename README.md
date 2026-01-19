@@ -48,6 +48,8 @@ Press `Ctrl+6` (or your configured key) to enter lookback mode:
 
 When you exit lookback mode, any cached output is processed and the current state is displayed.
 
+**Auto-lookback**: After 5 seconds of idle (no new renders), the full history is automatically displayed so you can scroll back without pressing any keys.
+
 ## Configuration
 
 Create `~/.config/claude-chill.toml`:
