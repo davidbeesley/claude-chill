@@ -4,23 +4,22 @@ use std::fs;
 use std::path::PathBuf;
 
 const DEFAULT_LOOKBACK_KEY: &str = "[ctrl][6]";
+const DEFAULT_REFRESH_RATE: u64 = 20;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub max_lines: usize,
     pub history_lines: usize,
     pub lookback_key: String,
-    pub auto_lookback_timeout_ms: u64,
+    pub refresh_rate: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            max_lines: 100,
             history_lines: 100_000,
             lookback_key: DEFAULT_LOOKBACK_KEY.to_string(),
-            auto_lookback_timeout_ms: 1000,
+            refresh_rate: DEFAULT_REFRESH_RATE,
         }
     }
 }
@@ -80,6 +79,11 @@ impl Config {
                     .unwrap_or_else(|_| b"\x1b[5;6~".to_vec())
             })
     }
+
+    pub fn redraw_throttle_ms(&self) -> u64 {
+        let rate = self.refresh_rate.max(1);
+        1000 / rate
+    }
 }
 
 #[cfg(test)]
@@ -89,10 +93,10 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.max_lines, 100);
         assert_eq!(config.history_lines, 100_000);
         assert_eq!(config.lookback_key, "[ctrl][6]");
-        assert_eq!(config.auto_lookback_timeout_ms, 1000);
+        assert_eq!(config.refresh_rate, 20);
+        assert_eq!(config.redraw_throttle_ms(), 50);
     }
 
     #[test]
