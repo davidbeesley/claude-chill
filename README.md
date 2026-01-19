@@ -53,7 +53,7 @@ Options:
   -H, --history <HISTORY_LINES>
           Max lines stored for lookback (default: 100000)
   -k, --lookback-key <LOOKBACK_KEY>
-          Key to toggle lookback mode (default: "[ctrl][6]")
+          Key to toggle lookback mode, quote to prevent glob expansion (default: "[ctrl][6]")
   -a, --auto-lookback-timeout <AUTO_LOOKBACK_TIMEOUT>
           Auto-lookback timeout in ms, 0 to disable (default: 5000)
   -h, --help

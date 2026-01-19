@@ -18,7 +18,7 @@ pub struct Cli {
     #[arg(short = 'H', long = "history")]
     pub history_lines: Option<usize>,
 
-    /// Key to toggle lookback mode (default: "[ctrl][6]")
+    /// Key to toggle lookback mode, quote to prevent glob expansion (default: "[ctrl][6]")
     #[arg(short = 'k', long = "lookback-key")]
     pub lookback_key: Option<String>,
 
