@@ -5,3 +5,6 @@ pub mod key_parser;
 pub mod line_buffer;
 pub mod proxy;
 pub mod redraw_throttler;
+
+#[cfg(test)]
+mod vt_history_tests;

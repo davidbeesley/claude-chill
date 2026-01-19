@@ -1,10 +1,8 @@
-use crate::escape_filter::TerminalQueryFilter;
 use crate::escape_sequences::{
     ALT_SCREEN_ENTER, ALT_SCREEN_ENTER_LEGACY, ALT_SCREEN_EXIT, ALT_SCREEN_EXIT_LEGACY,
     CLEAR_SCREEN, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY, SYNC_BUFFER_CAPACITY,
     SYNC_END, SYNC_START,
 };
-use crate::line_buffer::LineBuffer;
 use anyhow::{Context, Result};
 use log::debug;
 use memchr::memmem;
@@ -94,8 +92,6 @@ pub struct Proxy {
     pty_master: OwnedFd,
     child: Child,
     original_termios: Option<Termios>,
-    history: LineBuffer,
-    history_filter: TerminalQueryFilter,
     vt_parser: vt100::Parser,
     vt_prev_screen: Option<vt100::Screen>,
     last_output_time: Option<Instant>,
@@ -160,20 +156,14 @@ impl Proxy {
         drop(pty.slave);
         set_nonblocking(&pty.master)?;
 
-        let vt_parser = vt100::Parser::new(winsize.ws_row, winsize.ws_col, 0);
-
-        // Seed history with clear screen so replay starts fresh
-        let mut history = LineBuffer::new(config.max_history_lines);
-        history.push_bytes(CLEAR_SCREEN);
-        history.push_bytes(CURSOR_HOME);
+        let vt_parser =
+            vt100::Parser::new(winsize.ws_row, winsize.ws_col, config.max_history_lines);
 
         let auto_lookback_timeout = Duration::from_millis(config.auto_lookback_timeout_ms);
 
         debug!("Proxy::spawn: command={} args={:?}", command, args);
 
         Ok(Self {
-            history,
-            history_filter: TerminalQueryFilter::new(),
             config,
             pty_master: pty.master,
             child,
@@ -299,10 +289,8 @@ impl Proxy {
         );
 
         if self.in_alternate_screen {
-            // Still feed VT and history while in alt screen so they stay in sync
             if feed_vt {
                 self.vt_parser.process(data);
-                self.push_to_history(data);
             }
             return self.process_output_alt_screen(data, stdout_fd);
         }
@@ -320,7 +308,7 @@ impl Proxy {
         self.vt_render_pending = true;
         self.last_output_time = Some(Instant::now());
 
-        // Process sync blocks for history management
+        // Process sync blocks to detect full redraws (clear VT scrollback)
         let mut pos = 0;
         while pos < data.len() {
             // Check for alt screen enter
@@ -329,19 +317,13 @@ impl Proxy {
                     "process_output: ALT_SCREEN_ENTER detected at pos={}",
                     pos + alt_pos
                 );
-                // Add ALL remaining data to history (including alt screen enter and content)
-                // This ensures history matches VT exactly
-                let remaining = &data[pos..];
                 if self.in_sync_block {
-                    self.sync_buffer.extend_from_slice(remaining);
-                    self.flush_sync_block_to_history();
+                    self.sync_buffer.extend_from_slice(&data[pos..]);
+                    self.check_sync_block_for_full_redraw();
                     self.in_sync_block = false;
-                } else {
-                    self.push_to_history(remaining);
                 }
                 self.in_alternate_screen = true;
                 let seq_len = self.alt_screen_enter_len(&data[pos + alt_pos..]);
-                // Write alt screen enter directly
                 write_all(stdout_fd, &data[pos + alt_pos..pos + alt_pos + seq_len])?;
                 return self.process_output_alt_screen(&data[pos + alt_pos + seq_len..], stdout_fd);
             }
@@ -351,7 +333,7 @@ impl Proxy {
                     debug!("process_output: SYNC_END at pos={}", pos + idx);
                     self.sync_buffer.extend_from_slice(&data[pos..pos + idx]);
                     self.sync_buffer.extend_from_slice(SYNC_END);
-                    self.flush_sync_block_to_history();
+                    self.check_sync_block_for_full_redraw();
                     self.in_sync_block = false;
                     pos += idx + SYNC_END.len();
                 } else {
@@ -360,17 +342,11 @@ impl Proxy {
                 }
             } else if let Some(idx) = self.sync_start_finder.find(&data[pos..]) {
                 debug!("process_output: SYNC_START at pos={}", pos + idx);
-                // Add any data before SYNC_START to history
-                if idx > 0 {
-                    self.push_to_history(&data[pos..pos + idx]);
-                }
                 self.in_sync_block = true;
                 self.sync_buffer.clear();
                 self.sync_buffer.extend_from_slice(SYNC_START);
                 pos += idx + SYNC_START.len();
             } else {
-                // No sync block, just add to history
-                self.push_to_history(&data[pos..]);
                 break;
             }
         }
@@ -462,33 +438,22 @@ impl Proxy {
         }
     }
 
-    fn flush_sync_block_to_history(&mut self) {
+    fn check_sync_block_for_full_redraw(&mut self) {
         let has_clear_screen = self.clear_screen_finder.find(&self.sync_buffer).is_some();
         let has_cursor_home = self.cursor_home_finder.find(&self.sync_buffer).is_some();
         let is_full_redraw = has_clear_screen && has_cursor_home;
 
         debug!(
-            "flush_sync_block: len={} full_redraw={}",
+            "check_sync_block: len={} full_redraw={}",
             self.sync_buffer.len(),
             is_full_redraw
         );
 
         if is_full_redraw {
-            debug!("CLEARING HISTORY");
-            self.history.clear();
-            // Re-seed with clear screen after clearing
-            self.history.push_bytes(CLEAR_SCREEN);
-            self.history.push_bytes(CURSOR_HOME);
+            debug!("CLEARING VT SCROLLBACK");
+            self.vt_parser.screen_mut().clear_scrollback();
         }
-        self.push_to_history(&self.sync_buffer.clone());
         self.sync_buffer.clear();
-    }
-
-    /// Push data to history, filtering out terminal query sequences that would
-    /// cause the terminal to respond when replayed.
-    fn push_to_history(&mut self, data: &[u8]) {
-        let filtered = self.history_filter.filter(data);
-        self.history.push_bytes(&filtered);
     }
 
     fn flush_pending_vt_render<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
@@ -593,17 +558,14 @@ impl Proxy {
     }
 
     fn dump_history<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        let history = self.get_full_vt_history();
         debug!(
-            "dump_history: history_bytes={} lines={}",
-            self.history.total_bytes(),
-            self.history.line_count()
+            "dump_history: history_bytes={} scrollback_rows={}",
+            history.len(),
+            self.vt_parser.screen().scrollback_row_count()
         );
-        self.output_buffer.clear();
-        self.history.append_all(&mut self.output_buffer);
 
-        write_all(stdout_fd, CLEAR_SCREEN)?;
-        write_all(stdout_fd, CURSOR_HOME)?;
-        write_all(stdout_fd, &self.output_buffer)?;
+        write_all(stdout_fd, &history)?;
 
         // Force full VT render on next output since terminal now shows history
         self.vt_prev_screen = None;
@@ -685,26 +647,18 @@ impl Proxy {
     }
 
     fn enter_lookback_mode(&mut self) -> Result<()> {
+        let history = self.get_full_vt_history();
         debug!(
-            "enter_lookback_mode: history_bytes={} lines={}",
-            self.history.total_bytes(),
-            self.history.line_count()
+            "enter_lookback_mode: history_bytes={} scrollback_rows={}",
+            history.len(),
+            self.vt_parser.screen().scrollback_row_count()
         );
         self.in_lookback_mode = true;
         self.lookback_cache.clear();
         self.vt_render_pending = false;
 
-        self.output_buffer.clear();
-        self.history.append_all(&mut self.output_buffer);
-        debug!(
-            "enter_lookback_mode: output_buffer_len={}",
-            self.output_buffer.len()
-        );
-
         let stdout_fd = io::stdout();
-        write_all(&stdout_fd, CLEAR_SCREEN)?;
-        write_all(&stdout_fd, CURSOR_HOME)?;
-        write_all(&stdout_fd, &self.output_buffer)?;
+        write_all(&stdout_fd, &history)?;
 
         let exit_msg = format!(
             "\r\n\x1b[7m--- LOOKBACK MODE: press {} or Ctrl+C to exit ---\x1b[0m\r\n",
@@ -780,6 +734,21 @@ impl Proxy {
             Ok(status) => Ok(exit_code_from_status(status)),
             Err(e) => anyhow::bail!("wait failed: {}", e),
         }
+    }
+
+    pub fn get_full_vt_history(&self) -> Vec<u8> {
+        let screen = self.vt_parser.screen();
+        let (_, cols) = screen.size();
+        let mut output = Vec::new();
+
+        for row in screen.scrollback_rows() {
+            row.write_contents_formatted(&mut output, 0, cols, 0, false, None, None);
+            output.extend_from_slice(b"\r\n");
+        }
+
+        output.extend_from_slice(&screen.contents_formatted());
+
+        output
     }
 }
 
