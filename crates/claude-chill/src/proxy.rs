@@ -744,7 +744,7 @@ fn get_terminal_size() -> Result<Winsize> {
             &mut ws,
         )
     };
-    if ret == -1 {
+    if ret == -1 || ws.ws_row == 0 || ws.ws_col == 0 {
         ws.ws_row = 24;
         ws.ws_col = 80;
     }
