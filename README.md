@@ -99,35 +99,7 @@ When you exit lookback mode, any cached output is processed and the current stat
 
 After 5 seconds of idle (no new renders), the full history is automatically dumped to your terminal so you can scroll back without pressing any keys. This is useful for reviewing Claude's output after it finishes working.
 
-**Note:** The auto-lookback causes a brief screen flicker during the transition as it clears the screen and writes the history buffer. If this is distracting, you can disable it.
-
-### Disabling Auto-Lookback
-
-**Via command line:**
-```bash
-claude-chill -a 0 claude
-# or
-claude-chill --auto-lookback-timeout 0 claude
-```
-
-**Via config file** (`~/.config/claude-chill.toml`):
-```toml
-auto_lookback_timeout_ms = 0
-```
-
-### Adjusting the Timeout
-
-You can change the idle timeout before auto-lookback triggers:
-
-```bash
-# Trigger after 10 seconds of idle
-claude-chill -a 10000 claude
-```
-
-Or in the config file:
-```toml
-auto_lookback_timeout_ms = 10000  # 10 seconds
-```
+**Note:** The auto-lookback causes a brief screen flicker during the transition as it clears the screen and writes the history buffer. Disable with `-a 0` or adjust the timeout with `-a 10000` (10 seconds).
 
 ## Configuration
 
@@ -149,6 +121,8 @@ Note: History is cleared on full screen redraws, so lookback shows output since 
 Modifiers: `[ctrl]`, `[shift]`, `[alt]`
 
 Keys: `[a]`-`[z]`, `[f1]`-`[f12]`, `[pageup]`, `[pagedown]`, `[home]`, `[end]`, `[enter]`, `[tab]`, `[space]`, `[esc]`
+
+**Note:** Quote the key value on the command line to prevent shell glob expansion: `-k "[ctrl][7]"`
 
 ### Why Ctrl+6?
 
