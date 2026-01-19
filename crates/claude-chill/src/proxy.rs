@@ -1,3 +1,4 @@
+use crate::escape_filter::TerminalQueryFilter;
 use crate::escape_sequences::{
     ALT_SCREEN_ENTER, ALT_SCREEN_ENTER_LEGACY, ALT_SCREEN_EXIT, ALT_SCREEN_EXIT_LEGACY,
     CLEAR_SCREEN, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY, SYNC_BUFFER_CAPACITY,
@@ -94,6 +95,7 @@ pub struct Proxy {
     child: Child,
     original_termios: Option<Termios>,
     history: LineBuffer,
+    history_filter: TerminalQueryFilter,
     vt_parser: vt100::Parser,
     vt_prev_screen: Option<vt100::Screen>,
     last_output_time: Option<Instant>,
@@ -171,6 +173,7 @@ impl Proxy {
 
         Ok(Self {
             history,
+            history_filter: TerminalQueryFilter::new(),
             config,
             pty_master: pty.master,
             child,
@@ -299,7 +302,7 @@ impl Proxy {
             // Still feed VT and history while in alt screen so they stay in sync
             if feed_vt {
                 self.vt_parser.process(data);
-                self.history.push_bytes(data);
+                self.push_to_history(data);
             }
             return self.process_output_alt_screen(data, stdout_fd);
         }
@@ -334,7 +337,7 @@ impl Proxy {
                     self.flush_sync_block_to_history();
                     self.in_sync_block = false;
                 } else {
-                    self.history.push_bytes(remaining);
+                    self.push_to_history(remaining);
                 }
                 self.in_alternate_screen = true;
                 let seq_len = self.alt_screen_enter_len(&data[pos + alt_pos..]);
@@ -359,7 +362,7 @@ impl Proxy {
                 debug!("process_output: SYNC_START at pos={}", pos + idx);
                 // Add any data before SYNC_START to history
                 if idx > 0 {
-                    self.history.push_bytes(&data[pos..pos + idx]);
+                    self.push_to_history(&data[pos..pos + idx]);
                 }
                 self.in_sync_block = true;
                 self.sync_buffer.clear();
@@ -367,7 +370,7 @@ impl Proxy {
                 pos += idx + SYNC_START.len();
             } else {
                 // No sync block, just add to history
-                self.history.push_bytes(&data[pos..]);
+                self.push_to_history(&data[pos..]);
                 break;
             }
         }
@@ -477,8 +480,15 @@ impl Proxy {
             self.history.push_bytes(CLEAR_SCREEN);
             self.history.push_bytes(CURSOR_HOME);
         }
-        self.history.push_bytes(&self.sync_buffer);
+        self.push_to_history(&self.sync_buffer.clone());
         self.sync_buffer.clear();
+    }
+
+    /// Push data to history, filtering out terminal query sequences that would
+    /// cause the terminal to respond when replayed.
+    fn push_to_history(&mut self, data: &[u8]) {
+        let filtered = self.history_filter.filter(data);
+        self.history.push_bytes(&filtered);
     }
 
     fn flush_pending_vt_render<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
