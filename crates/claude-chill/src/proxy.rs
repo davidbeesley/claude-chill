@@ -734,8 +734,8 @@ impl Proxy {
         let (_, cols) = screen.size();
         let mut output = Vec::new();
 
-        for row in screen.scrollback_rows() {
-            row.write_contents_formatted(&mut output, 0, cols, 0, false, None, None);
+        for row in screen.scrollback_rows(0, cols) {
+            output.extend_from_slice(row.as_bytes());
             output.extend_from_slice(b"\r\n");
         }
 

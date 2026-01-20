@@ -9,8 +9,8 @@ fn get_full_vt_history(parser: &vt100::Parser) -> Vec<u8> {
     let (_, cols) = screen.size();
     let mut output = Vec::new();
 
-    for row in screen.scrollback_rows() {
-        row.write_contents_formatted(&mut output, 0, cols, 0, false, None, None);
+    for row in screen.scrollback_rows(0, cols) {
+        output.extend_from_slice(row.as_bytes());
         output.extend_from_slice(b"\r\n");
     }
 
@@ -24,8 +24,8 @@ fn get_scrollback_text(parser: &vt100::Parser) -> String {
     let (_, cols) = screen.size();
     let mut text = String::new();
 
-    for row in screen.scrollback_rows() {
-        row.write_contents(&mut text, 0, cols, false);
+    for row in screen.scrollback_rows(0, cols) {
+        text.push_str(&row);
         text.push('\n');
     }
 
