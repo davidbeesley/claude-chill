@@ -147,6 +147,10 @@ claude-chill creates a pseudo-terminal (PTY) and spawns Claude Code as a child p
 5. **History via VT scrollback**: Lines that scroll off-screen are captured in the VT's scrollback buffer (cleared on full redraws)
 6. **Signal forwarding**: Window resize (SIGWINCH), interrupt (SIGINT), and terminate (SIGTERM) signals are forwarded to Claude
 
+## Dependencies
+
+This project uses a [patched fork of vt100-rust](https://github.com/davidbeesley/vt100-rust) that exposes scrollback buffer functionality (`scrollback_rows()`, `scrollback_row_count()`, and `clear_scrollback()` methods). This enables claude-chill to capture content that scrolls off-screen and display it during lookback mode. The dependency is pinned to a specific commit hash for reproducible builds.
+
 ## Disclaimer
 
 This tool was developed for personal convenience. It works for me on Linux and macOS, but it hasn't been extensively tested across different terminals or edge cases. Don't use it to send anyone to space, perform surgery, or run critical infrastructure. If it breaks, you get to keep both pieces.

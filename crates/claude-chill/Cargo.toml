@@ -25,6 +25,6 @@ nix = { version = "0.30", features = ["term", "signal", "poll", "process", "fs"]
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-vt100 = { git = "https://github.com/davidbeesley/vt100-rust", branch = "main" }
+vt100 = { git = "https://github.com/davidbeesley/vt100-rust", rev = "61ccec553c4facd3091a2de5f92ee7a31bb8ba28" }
 log = "0.4"
 env_logger = "0.11"
