@@ -21,8 +21,8 @@ claude-chill sits between your terminal and Claude Code:
 
 1. **Intercepts sync blocks** - Catches those massive atomic updates
 2. **VT-based rendering** - Uses a VT100 emulator to track screen state and renders only the differences
-3. **Preserves history** - Accumulates content in a buffer for lookback
-4. **Enables lookback** - Press a key to pause Claude and view the full history buffer
+3. **Preserves history** - VT scrollback captures content as it scrolls off-screen
+4. **Enables lookback** - Press a key to pause Claude and view the full scrollback history
 
 ## Installation
 
@@ -89,7 +89,7 @@ claude-chill -H 50000 -a 0 -- claude --verbose
 Press `Ctrl+6` (or your configured key) to enter lookback mode:
 
 1. **Claude pauses** - Output from Claude is cached, input is blocked
-2. **History dumps** - The full history buffer is written to your terminal
+2. **History dumps** - The VT scrollback plus current screen is written to your terminal
 3. **Scroll freely** - Use your terminal's scrollback to review everything
 4. **Exit** - Press the lookback key again or `Ctrl+C` to resume
 
@@ -97,9 +97,9 @@ When you exit lookback mode, any cached output is processed and the current stat
 
 ## Auto-Lookback
 
-After 5 seconds of idle (no new renders), the full history is automatically dumped to your terminal so you can scroll back without pressing any keys. This is useful for reviewing Claude's output after it finishes working.
+After 5 seconds of idle (no new renders), the VT scrollback plus current screen is automatically dumped to your terminal so you can scroll back without pressing any keys. This is useful for reviewing Claude's output after it finishes working.
 
-**Note:** The auto-lookback causes a brief screen flicker during the transition as it clears the screen and writes the history buffer. Disable with `-a 0` or adjust the timeout with `-a 10000` (10 seconds).
+**Note:** The auto-lookback causes a brief screen flicker during the transition as it writes the scrollback history. Disable with `-a 0` or adjust the timeout with `-a 10000` (10 seconds).
 
 ## Configuration
 
@@ -112,7 +112,7 @@ refresh_rate = 20               # Rendering FPS
 auto_lookback_timeout_ms = 5000 # Auto-lookback after 5s idle (0 to disable)
 ```
 
-Note: History is cleared on full screen redraws, so lookback shows output since Claude's last full render.
+Note: VT scrollback is cleared on full screen redraws (clear screen + cursor home), so lookback shows output since Claude's last full render.
 
 ### Key Format
 
@@ -142,9 +142,9 @@ claude-chill creates a pseudo-terminal (PTY) and spawns Claude Code as a child p
 
 1. **Input handling**: Keystrokes pass through to Claude, except for the lookback key which toggles lookback mode
 2. **Output processing**: Scans output for sync block markers. Non-sync output passes through directly
-3. **VT emulation**: Feeds output through a VT100 emulator to track the virtual screen state
+3. **VT emulation**: Feeds output through a VT100 emulator to track the virtual screen state with scrollback
 4. **Differential rendering**: Compares current screen to previous and emits only the changes
-5. **History tracking**: Maintains a buffer of output for lookback mode since the last full redraw
+5. **History via VT scrollback**: Lines that scroll off-screen are captured in the VT's scrollback buffer (cleared on full redraws)
 6. **Signal forwarding**: Window resize (SIGWINCH), interrupt (SIGINT), and terminate (SIGTERM) signals are forwarded to Claude
 
 ## Disclaimer
