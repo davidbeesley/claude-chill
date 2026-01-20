@@ -360,25 +360,18 @@ impl Proxy {
                 "process_output_alt_screen: ALT_SCREEN_EXIT detected at pos={}",
                 exit_pos
             );
-            write_all(stdout_fd, &data[..exit_pos])?;
-            let seq_len = self.alt_screen_exit_len(&data[exit_pos..]);
-            write_all(stdout_fd, &data[exit_pos..exit_pos + seq_len])?;
+            // Write all data through (VT already processed it)
+            write_all(stdout_fd, data)?;
             self.in_alternate_screen = false;
 
-            // Force full VT render to restore main screen content
-            debug!("process_output_alt_screen: rendering VT screen after alt exit");
-            self.vt_prev_screen = None;
-            self.render_vt_screen(stdout_fd)?;
+            // Don't render here - both VT and terminal restore their main buffers,
+            // which should be in sync. Let normal render loop handle any updates.
 
-            // Data after ALT_EXIT was already fed to VT and history when we processed
-            // the alt screen chunk, so we just need to check for more alt screen transitions
+            // Check if there's another alt screen enter after the exit
+            let seq_len = self.alt_screen_exit_len(&data[exit_pos..]);
             let remaining = &data[exit_pos + seq_len..];
-            if !remaining.is_empty() {
-                // Check if there's another alt screen enter in the remaining data
-                if self.find_alt_screen_enter(remaining).is_some() {
-                    // Need to process for alt screen detection, but skip VT/history feed
-                    return self.process_output_check_alt_only(remaining, stdout_fd);
-                }
+            if !remaining.is_empty() && self.find_alt_screen_enter(remaining).is_some() {
+                return self.process_output_check_alt_only(remaining, stdout_fd);
             }
             return Ok(());
         }
