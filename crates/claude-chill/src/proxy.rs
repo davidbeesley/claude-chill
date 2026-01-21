@@ -299,10 +299,11 @@ impl Proxy {
         );
 
         if self.in_alternate_screen {
-            // Still feed VT and history while in alt screen so they stay in sync
+            // Feed VT to track screen state, but don't add to history.
+            // Alternate screen content is ephemeral and shouldn't be in scrollback.
+            // This also prevents bells and other control chars from being replayed.
             if feed_vt {
                 self.vt_parser.process(data);
-                self.push_to_history(data);
             }
             return self.process_output_alt_screen(data, stdout_fd);
         }
