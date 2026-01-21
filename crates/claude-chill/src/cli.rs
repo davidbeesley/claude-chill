@@ -22,7 +22,7 @@ pub struct Cli {
     #[arg(short = 'k', long = "lookback-key")]
     pub lookback_key: Option<String>,
 
-    /// Auto-lookback timeout in ms, 0 to disable (default: 5000)
+    /// Auto-lookback timeout in ms, 0 to disable (default: 100)
     #[arg(short = 'a', long = "auto-lookback-timeout")]
     pub auto_lookback_timeout: Option<u64>,
 }

@@ -12,3 +12,21 @@ pub const ALT_SCREEN_EXIT_LEGACY: &[u8] = b"\x1b[?47l";
 pub const SYNC_BUFFER_CAPACITY: usize = 1024 * 1024;
 pub const OUTPUT_BUFFER_CAPACITY: usize = 32768;
 pub const INPUT_BUFFER_CAPACITY: usize = 64;
+
+pub fn strip_sync_markers(data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(data.len());
+    let mut i = 0;
+
+    while i < data.len() {
+        if data[i..].starts_with(SYNC_START) {
+            i += SYNC_START.len();
+        } else if data[i..].starts_with(SYNC_END) {
+            i += SYNC_END.len();
+        } else {
+            result.push(data[i]);
+            i += 1;
+        }
+    }
+
+    result
+}

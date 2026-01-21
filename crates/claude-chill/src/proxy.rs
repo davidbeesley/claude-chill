@@ -2,7 +2,7 @@ use crate::escape_filter::TerminalQueryFilter;
 use crate::escape_sequences::{
     ALT_SCREEN_ENTER, ALT_SCREEN_ENTER_LEGACY, ALT_SCREEN_EXIT, ALT_SCREEN_EXIT_LEGACY,
     CLEAR_SCREEN, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY, SYNC_BUFFER_CAPACITY,
-    SYNC_END, SYNC_START,
+    SYNC_END, SYNC_START, strip_sync_markers,
 };
 use crate::line_buffer::LineBuffer;
 use anyhow::{Context, Result};
@@ -58,7 +58,7 @@ impl Default for ProxyConfig {
             max_history_lines: 100_000,
             lookback_key: "[ctrl][6]".to_string(),
             lookback_sequence: vec![0x1E],
-            auto_lookback_timeout_ms: 5000,
+            auto_lookback_timeout_ms: 100,
         }
     }
 }
@@ -601,9 +601,13 @@ impl Proxy {
         self.output_buffer.clear();
         self.history.append_all(&mut self.output_buffer);
 
+        let stripped = strip_sync_markers(&self.output_buffer);
+
+        write_all(stdout_fd, SYNC_START)?;
         write_all(stdout_fd, CLEAR_SCREEN)?;
         write_all(stdout_fd, CURSOR_HOME)?;
-        write_all(stdout_fd, &self.output_buffer)?;
+        write_all(stdout_fd, &stripped)?;
+        write_all(stdout_fd, SYNC_END)?;
 
         // Force full VT render on next output since terminal now shows history
         self.vt_prev_screen = None;

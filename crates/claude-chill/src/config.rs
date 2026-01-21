@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 const DEFAULT_LOOKBACK_KEY: &str = "[ctrl][6]";
 const DEFAULT_REFRESH_RATE: u64 = 20;
-const DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS: u64 = 5000;
+const DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS: u64 = 100;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -100,7 +100,7 @@ mod tests {
         assert_eq!(config.lookback_key, "[ctrl][6]");
         assert_eq!(config.refresh_rate, 20);
         assert_eq!(config.redraw_throttle_ms(), 50);
-        assert_eq!(config.auto_lookback_timeout_ms, 5000);
+        assert_eq!(config.auto_lookback_timeout_ms, 100);
     }
 
     #[test]

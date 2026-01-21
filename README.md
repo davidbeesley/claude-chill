@@ -55,7 +55,7 @@ Options:
   -k, --lookback-key <LOOKBACK_KEY>
           Key to toggle lookback mode, quote to prevent glob expansion (default: "[ctrl][6]")
   -a, --auto-lookback-timeout <AUTO_LOOKBACK_TIMEOUT>
-          Auto-lookback timeout in ms, 0 to disable (default: 5000)
+          Auto-lookback timeout in ms, 0 to disable (default: 100)
   -h, --help
           Print help
   -V, --version
@@ -93,13 +93,13 @@ Press `Ctrl+6` (or your configured key) to enter lookback mode:
 3. **Scroll freely** - Use your terminal's scrollback to review everything
 4. **Exit** - Press the lookback key again or `Ctrl+C` to resume
 
-When you exit lookback mode, any cached output is processed and the current state is displayed.
+The main purpose of lookback mode is to **freeze output** so you can read without Claude's updates scrolling content away. When you exit, any cached output is processed and the current state is displayed. The transition is flicker-free since the history dump is wrapped in sync blocks.
 
 ## Auto-Lookback
 
-After 5 seconds of idle (no new renders), the full history is automatically dumped to your terminal so you can scroll back without pressing any keys. This is useful for reviewing Claude's output after it finishes working.
+Auto-lookback keeps your terminal scrollback fresh by automatically dumping history after 100ms of idle (no new renders). This means you can scroll back at any time without pressing any keys - the display stays current with readable history. The dump is flicker-free since it's wrapped in sync blocks.
 
-**Note:** The auto-lookback causes a brief screen flicker during the transition as it clears the screen and writes the history buffer. Disable with `-a 0` or adjust the timeout with `-a 10000` (10 seconds).
+**Bandwidth note:** If you're on a slow or metered connection, auto-lookback's frequent history dumps may use significant bandwidth. Disable with `-a 0` or increase the timeout with `-a 1000` (1 second).
 
 ## Configuration
 
@@ -109,7 +109,7 @@ Create `~/.config/claude-chill.toml`:
 history_lines = 100000          # Max lines stored for lookback
 lookback_key = "[ctrl][6]"      # Key to toggle lookback mode
 refresh_rate = 20               # Rendering FPS
-auto_lookback_timeout_ms = 5000 # Auto-lookback after 5s idle (0 to disable)
+auto_lookback_timeout_ms = 100  # Auto-lookback after 100ms idle (0 to disable)
 ```
 
 Note: History is cleared on full screen redraws, so lookback shows output since Claude's last full render.
