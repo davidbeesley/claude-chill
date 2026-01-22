@@ -55,7 +55,7 @@ Options:
   -k, --lookback-key <LOOKBACK_KEY>
           Key to toggle lookback mode, quote to prevent glob expansion (default: "[ctrl][6]")
   -a, --auto-lookback-timeout <AUTO_LOOKBACK_TIMEOUT>
-          Auto-lookback timeout in ms, 0 to disable (default: 5000)
+          Auto-lookback timeout in ms, 0 to disable (default: 15000)
   -h, --help
           Print help
   -V, --version
@@ -97,19 +97,21 @@ When you exit lookback mode, any cached output is processed and the current stat
 
 ## Auto-Lookback
 
-After 5 seconds of idle (no new renders), the full history is automatically dumped to your terminal so you can scroll back without pressing any keys. This is useful for reviewing Claude's output after it finishes working.
+After `auto_lookback_timeout_ms` (default 15 seconds) of idle (no user input), the full history is automatically dumped to your terminal so you can scroll back without pressing any keys. This continues to re-dump every `auto_lookback_timeout_ms` while idle. This is useful for reviewing Claude's output after it finishes working.
 
-**Note:** The auto-lookback causes a brief screen flicker during the transition as it clears the screen and writes the history buffer. Disable with `-a 0` or adjust the timeout with `-a 10000` (10 seconds).
+**Note:** The auto-lookback causes a brief screen flicker during the transition as it clears the screen and writes the history buffer. Disable with `-a 0` or adjust the timeout with `-a 30000` (30 seconds).
 
 ## Configuration
 
-Create `~/.config/claude-chill.toml`:
+Config file location:
+- **Linux**: `~/.config/claude-chill.toml`
+- **macOS**: `~/Library/Application Support/claude-chill.toml`
 
 ```toml
-history_lines = 100000          # Max lines stored for lookback
-lookback_key = "[ctrl][6]"      # Key to toggle lookback mode
-refresh_rate = 20               # Rendering FPS
-auto_lookback_timeout_ms = 5000 # Auto-lookback after 5s idle (0 to disable)
+history_lines = 100000           # Max lines stored for lookback
+lookback_key = "[ctrl][6]"       # Key to toggle lookback mode
+refresh_rate = 20                # Rendering FPS
+auto_lookback_timeout_ms = 15000 # Auto-lookback after 15s idle (0 to disable)
 ```
 
 Note: History is cleared on full screen redraws, so lookback shows output since Claude's last full render.
