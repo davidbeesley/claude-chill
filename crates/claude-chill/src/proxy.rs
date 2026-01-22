@@ -58,7 +58,7 @@ impl Default for ProxyConfig {
             max_history_lines: 100_000,
             lookback_key: "[ctrl][6]".to_string(),
             lookback_sequence: vec![0x1E],
-            auto_lookback_timeout_ms: 5000,
+            auto_lookback_timeout_ms: 15000,
         }
     }
 }
@@ -100,6 +100,8 @@ pub struct Proxy {
     vt_prev_screen: Option<vt100::Screen>,
     last_output_time: Option<Instant>,
     last_render_time: Option<Instant>,
+    last_stdin_time: Option<Instant>,
+    last_auto_lookback_time: Option<Instant>,
     auto_lookback_timeout: Duration,
     sync_buffer: Vec<u8>,
     in_sync_block: bool,
@@ -182,6 +184,8 @@ impl Proxy {
             vt_prev_screen: None,
             last_output_time: None,
             last_render_time: None,
+            last_stdin_time: None,
+            last_auto_lookback_time: None,
             auto_lookback_timeout,
             sync_buffer: Vec::with_capacity(SYNC_BUFFER_CAPACITY),
             in_sync_block: false,
@@ -581,14 +585,38 @@ impl Proxy {
         if self.in_lookback_mode || self.in_alternate_screen {
             return Ok(());
         }
+
+        // Check if enough time has passed since last stdin activity
+        let Some(stdin_time) = self.last_stdin_time else {
+            return Ok(());
+        };
+        if stdin_time.elapsed() < self.auto_lookback_timeout {
+            return Ok(());
+        }
+
+        // Check if there's been new output since last auto-lookback
+        // AND enough time has passed since we last dumped
         let Some(render_time) = self.last_render_time else {
             return Ok(());
         };
-        if render_time.elapsed() < self.auto_lookback_timeout {
-            return Ok(());
+        if let Some(last_auto) = self.last_auto_lookback_time {
+            let no_new_output = render_time <= last_auto;
+            let too_soon = last_auto.elapsed() < self.auto_lookback_timeout;
+            if no_new_output || too_soon {
+                return Ok(());
+            }
         }
+
+        debug!(
+            "auto_lookback triggered: stdin_idle={}ms render_age={}ms last_auto_age={}ms",
+            stdin_time.elapsed().as_millis(),
+            render_time.elapsed().as_millis(),
+            self.last_auto_lookback_time
+                .map(|t| t.elapsed().as_millis())
+                .unwrap_or(0)
+        );
         self.dump_history(stdout_fd)?;
-        self.last_render_time = None;
+        self.last_auto_lookback_time = Some(Instant::now());
         Ok(())
     }
 
@@ -611,6 +639,8 @@ impl Proxy {
     }
 
     fn process_input<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
+        self.last_stdin_time = Some(Instant::now());
+
         if self.in_alternate_screen {
             return write_all(&self.pty_master, data);
         }

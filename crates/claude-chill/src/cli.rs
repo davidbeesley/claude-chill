@@ -1,9 +1,11 @@
 use clap::Parser;
 
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")");
+
 #[derive(Parser, Debug)]
 #[command(
     name = "claude-chill",
-    version,
+    version = VERSION,
     about = "A PTY proxy that tames Claude Code's massive terminal updates"
 )]
 pub struct Cli {
@@ -22,7 +24,7 @@ pub struct Cli {
     #[arg(short = 'k', long = "lookback-key")]
     pub lookback_key: Option<String>,
 
-    /// Auto-lookback timeout in ms, 0 to disable (default: 5000)
+    /// Auto-lookback timeout in ms, 0 to disable (default: 15000)
     #[arg(short = 'a', long = "auto-lookback-timeout")]
     pub auto_lookback_timeout: Option<u64>,
 }
