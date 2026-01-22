@@ -48,6 +48,11 @@ impl LineBuffer {
         self.lines.len() + if self.current_line.is_empty() { 0 } else { 1 }
     }
 
+    /// 只計算完成的行數（不含 current_line）
+    pub fn completed_line_count(&self) -> usize {
+        self.lines.len()
+    }
+
     pub fn total_bytes(&self) -> usize {
         self.cached_bytes + self.current_line.len()
     }
@@ -73,6 +78,18 @@ impl LineBuffer {
         }
         if !self.current_line.is_empty() {
             output.extend_from_slice(&self.current_line);
+        }
+    }
+
+    /// Append lines from start_line to end_line (exclusive)
+    pub fn append_range(&self, start_line: usize, end_line: usize, output: &mut Vec<u8>) {
+        let end_line = end_line.min(self.lines.len());
+        if start_line >= end_line {
+            return;
+        }
+        for line in self.lines.iter().skip(start_line).take(end_line - start_line) {
+            output.extend_from_slice(line);
+            output.push(b'\n');
         }
     }
 }

@@ -109,6 +109,8 @@ pub struct Proxy {
     lookback_cache: Vec<u8>,
     lookback_input_buffer: Vec<u8>,
     output_buffer: Vec<u8>,
+    scrollback_buffer: Vec<u8>,  // Last dump result for incremental diff
+    scrollback_sent_lines: usize,  // Number of scrollback lines sent (unused)
     sync_start_finder: memmem::Finder<'static>,
     sync_end_finder: memmem::Finder<'static>,
     clear_screen_finder: memmem::Finder<'static>,
@@ -160,7 +162,8 @@ impl Proxy {
         drop(pty.slave);
         set_nonblocking(&pty.master)?;
 
-        let vt_parser = vt100::Parser::new(winsize.ws_row, winsize.ws_col, 0);
+        // Enable scrollback in vt_parser to preserve scrolled-out lines
+        let vt_parser = vt100::Parser::new(winsize.ws_row, winsize.ws_col, config.max_history_lines);
 
         // Seed history with clear screen so replay starts fresh
         let mut history = LineBuffer::new(config.max_history_lines);
@@ -191,6 +194,8 @@ impl Proxy {
             lookback_cache: Vec::new(),
             lookback_input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
             output_buffer: Vec::with_capacity(OUTPUT_BUFFER_CAPACITY),
+            scrollback_buffer: Vec::new(),
+            scrollback_sent_lines: 0,
             sync_start_finder: memmem::Finder::new(SYNC_START),
             sync_end_finder: memmem::Finder::new(SYNC_END),
             clear_screen_finder: memmem::Finder::new(CLEAR_SCREEN),
@@ -273,9 +278,8 @@ impl Proxy {
         }
 
         // Final render before exit
-        if self.vt_render_pending {
-            self.render_vt_screen(&stdout_fd)?;
-        }
+        self.vt_render_pending = true;
+        self.render_vt_screen(&stdout_fd)?;
 
         self.wait_child()
     }
@@ -540,6 +544,17 @@ impl Proxy {
 
     fn render_vt_screen<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
         let is_diff = self.vt_prev_screen.is_some();
+
+        // First render: clear screen and home cursor
+        // Subsequent renders: sync scrollback incrementally
+        if !is_diff {
+            write_all(stdout_fd, CLEAR_SCREEN)?;
+            write_all(stdout_fd, CURSOR_HOME)?;
+        } else {
+            self.sync_scrollback_incremental(stdout_fd)?;
+        }
+
+        // Diff and render screen contents
         self.output_buffer.clear();
         self.output_buffer.extend_from_slice(SYNC_START);
 
@@ -550,9 +565,16 @@ impl Proxy {
                     .extend_from_slice(&self.vt_parser.screen().contents_diff(prev));
             }
             None => {
-                // First render: full screen
-                self.output_buffer
-                    .extend_from_slice(&self.vt_parser.screen().contents_formatted());
+                // First render: full screen (clear screen already handled above)
+                let mut content = self.vt_parser.screen().contents_formatted();
+                // Filter out leading clear screen sequences
+                if content.starts_with(CLEAR_SCREEN) {
+                    content.drain(0..CLEAR_SCREEN.len());
+                }
+                if content.starts_with(CURSOR_HOME) {
+                    content.drain(0..CURSOR_HOME.len());
+                }
+                self.output_buffer.extend_from_slice(&content);
             }
         }
 
@@ -571,24 +593,44 @@ impl Proxy {
         self.vt_prev_screen = Some(self.vt_parser.screen().clone());
         self.vt_render_pending = false;
         self.last_render_time = Some(Instant::now());
+
         Ok(())
     }
 
-    fn check_auto_lookback<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
-        if self.auto_lookback_timeout.is_zero() {
+    fn sync_scrollback_incremental<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        // Check if screen is full (>= 23 lines)
+        // Only start scrollback sync when screen is nearly full
+        let screen_text = self.vt_parser.screen().contents();
+        let screen_lines = screen_text.lines().count();
+
+        if screen_lines < 23 {
+            // Screen not full yet, just update buffer without sending
+            let mut current_dump = Vec::new();
+            self.history.append_all(&mut current_dump);
+            self.scrollback_buffer = current_dump;
             return Ok(());
         }
-        if self.in_lookback_mode || self.in_alternate_screen {
-            return Ok(());
+
+        // Dump current history (same as original auto-lookback)
+        let mut current_dump = Vec::new();
+        self.history.append_all(&mut current_dump);
+
+        // Diff: find new content since last sync
+        if current_dump.len() > self.scrollback_buffer.len() {
+            let new_content = &current_dump[self.scrollback_buffer.len()..];
+
+            // Send only the incremental new content
+            write_all(stdout_fd, new_content)?;
         }
-        let Some(render_time) = self.last_render_time else {
-            return Ok(());
-        };
-        if render_time.elapsed() < self.auto_lookback_timeout {
-            return Ok(());
-        }
-        self.dump_history(stdout_fd)?;
-        self.last_render_time = None;
+
+        // Update buffer for next diff
+        self.scrollback_buffer = current_dump;
+
+        Ok(())
+    }
+
+    fn check_auto_lookback<F: AsFd>(&mut self, _stdout_fd: &F) -> Result<()> {
+        // Disabled: scrollback is now handled by sync_scrollback_incremental
         Ok(())
     }
 
