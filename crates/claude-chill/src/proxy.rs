@@ -595,15 +595,24 @@ impl Proxy {
         }
 
         // Check if there's been new output since last auto-lookback
+        // AND enough time has passed since we last dumped
         let Some(render_time) = self.last_render_time else {
             return Ok(());
         };
-        if let Some(last_auto) = self.last_auto_lookback_time
-            && render_time <= last_auto
-        {
-            return Ok(());
+        if let Some(last_auto) = self.last_auto_lookback_time {
+            let no_new_output = render_time <= last_auto;
+            let too_soon = last_auto.elapsed() < self.auto_lookback_timeout;
+            if no_new_output || too_soon {
+                return Ok(());
+            }
         }
 
+        debug!(
+            "auto_lookback triggered: stdin_idle={}ms render_age={}ms last_auto_age={}ms",
+            stdin_time.elapsed().as_millis(),
+            render_time.elapsed().as_millis(),
+            self.last_auto_lookback_time.map(|t| t.elapsed().as_millis()).unwrap_or(0)
+        );
         self.dump_history(stdout_fd)?;
         self.last_auto_lookback_time = Some(Instant::now());
         Ok(())
