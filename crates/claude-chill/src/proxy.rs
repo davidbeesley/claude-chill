@@ -611,7 +611,9 @@ impl Proxy {
             "auto_lookback triggered: stdin_idle={}ms render_age={}ms last_auto_age={}ms",
             stdin_time.elapsed().as_millis(),
             render_time.elapsed().as_millis(),
-            self.last_auto_lookback_time.map(|t| t.elapsed().as_millis()).unwrap_or(0)
+            self.last_auto_lookback_time
+                .map(|t| t.elapsed().as_millis())
+                .unwrap_or(0)
         );
         self.dump_history(stdout_fd)?;
         self.last_auto_lookback_time = Some(Instant::now());
