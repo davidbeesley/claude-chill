@@ -59,7 +59,7 @@ impl Default for ProxyConfig {
             max_history_lines: 100_000,
             lookback_key: "[ctrl][6]".to_string(),
             lookback_sequence_legacy: vec![0x1E],
-            lookback_sequence_kitty: b"\x1b[54;5u".to_vec(), // Kitty encoding for Ctrl+6
+            lookback_sequence_kitty: b"\x1b[54;5u".to_vec(),
             auto_lookback_timeout_ms: 15000,
         }
     }
@@ -807,7 +807,6 @@ impl Proxy {
     fn process_input<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
         self.last_stdin_time = Some(Instant::now());
 
-        // Check for Kitty query response to detect terminal support
         self.update_kitty_support_from_input(data);
 
         if self.in_alternate_screen {
