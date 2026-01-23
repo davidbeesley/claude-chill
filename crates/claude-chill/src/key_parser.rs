@@ -61,6 +61,29 @@ impl KeyCombination {
     pub fn to_escape_sequence(&self) -> Vec<u8> {
         key_to_escape_sequence(&self.code, &self.modifiers)
     }
+
+    pub fn to_kitty_sequence(&self) -> Option<Vec<u8>> {
+        let codepoint = match &self.code {
+            KeyCode::Char(c) => *c as u32,
+            KeyCode::Esc => 27,
+            KeyCode::Enter => 13,
+            KeyCode::Tab => 9,
+            KeyCode::Backspace => 127,
+            KeyCode::Space => 32,
+            _ => return None,
+        };
+
+        let modifier = 1
+            + if self.modifiers.shift { 1 } else { 0 }
+            + if self.modifiers.alt { 2 } else { 0 }
+            + if self.modifiers.ctrl { 4 } else { 0 };
+
+        if modifier == 1 {
+            Some(format!("\x1b[{}u", codepoint).into_bytes())
+        } else {
+            Some(format!("\x1b[{};{}u", codepoint, modifier).into_bytes())
+        }
+    }
 }
 
 impl fmt::Display for KeyCombination {

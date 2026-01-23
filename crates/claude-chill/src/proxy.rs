@@ -48,7 +48,8 @@ extern "C" fn handle_sigterm(_: libc::c_int) {
 pub struct ProxyConfig {
     pub max_history_lines: usize,
     pub lookback_key: String,
-    pub lookback_sequence: Vec<u8>,
+    pub lookback_sequence_legacy: Vec<u8>,
+    pub lookback_sequence_kitty: Vec<u8>,
     pub auto_lookback_timeout_ms: u64,
 }
 
@@ -57,7 +58,8 @@ impl Default for ProxyConfig {
         Self {
             max_history_lines: 100_000,
             lookback_key: "[ctrl][6]".to_string(),
-            lookback_sequence: vec![0x1E],
+            lookback_sequence_legacy: vec![0x1E],
+            lookback_sequence_kitty: b"\x1b[54;5u".to_vec(),
             auto_lookback_timeout_ms: 15000,
         }
     }
@@ -107,6 +109,10 @@ pub struct Proxy {
     in_sync_block: bool,
     in_lookback_mode: bool,
     in_alternate_screen: bool,
+    kitty_mode_supported: bool,
+    kitty_mode_enabled: bool,
+    kitty_input_buffer: Vec<u8>,
+    kitty_output_buffer: Vec<u8>,
     vt_render_pending: bool,
     lookback_cache: Vec<u8>,
     lookback_input_buffer: Vec<u8>,
@@ -119,6 +125,72 @@ pub struct Proxy {
     alt_screen_exit_finder: memmem::Finder<'static>,
     alt_screen_enter_legacy_finder: memmem::Finder<'static>,
     alt_screen_exit_legacy_finder: memmem::Finder<'static>,
+}
+
+const MAX_KITTY_SEQ_LEN: usize = 16;
+
+fn is_complete_kitty_output_seq(data: &[u8]) -> bool {
+    if data.len() < 4 || data[0] != 0x1b || data[1] != b'[' {
+        return false;
+    }
+    if data[2] == b'<' && data[3] == b'u' {
+        return true;
+    }
+    if data[2] == b'>' {
+        let mut j = 3;
+        while j < data.len() && data[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > 3 && j < data.len() && data[j] == b'u' {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_complete_kitty_input_seq(data: &[u8]) -> bool {
+    if data.len() < 5 || data[0] != 0x1b || data[1] != b'[' || data[2] != b'?' {
+        return false;
+    }
+    let mut j = 3;
+    while j < data.len() && data[j].is_ascii_digit() {
+        j += 1;
+    }
+    j > 3 && j < data.len() && data[j] == b'u'
+}
+
+fn kitty_output_split_point(buffer: &[u8]) -> usize {
+    let last_esc = buffer.iter().rposition(|&b| b == 0x1b);
+
+    match last_esc {
+        None => buffer.len(),
+        Some(pos) if pos + MAX_KITTY_SEQ_LEN <= buffer.len() => buffer.len(),
+        Some(pos) => {
+            let tail = &buffer[pos..];
+            if is_complete_kitty_output_seq(tail) {
+                buffer.len()
+            } else {
+                pos
+            }
+        }
+    }
+}
+
+fn kitty_input_split_point(buffer: &[u8]) -> usize {
+    let last_esc = buffer.iter().rposition(|&b| b == 0x1b);
+
+    match last_esc {
+        None => buffer.len(),
+        Some(pos) if pos + MAX_KITTY_SEQ_LEN <= buffer.len() => buffer.len(),
+        Some(pos) => {
+            let tail = &buffer[pos..];
+            if is_complete_kitty_input_seq(tail) {
+                buffer.len()
+            } else {
+                pos
+            }
+        }
+    }
 }
 
 impl Proxy {
@@ -191,6 +263,10 @@ impl Proxy {
             in_sync_block: false,
             in_lookback_mode: false,
             in_alternate_screen: false,
+            kitty_mode_supported: false,
+            kitty_mode_enabled: false,
+            kitty_input_buffer: Vec::with_capacity(16),
+            kitty_output_buffer: Vec::with_capacity(16),
             vt_render_pending: false,
             lookback_cache: Vec::new(),
             lookback_input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
@@ -301,6 +377,9 @@ impl Proxy {
             self.in_lookback_mode,
             feed_vt
         );
+
+        // Track Kitty keyboard protocol state from output
+        self.update_kitty_mode_from_output(data);
 
         if self.in_alternate_screen {
             // Still feed VT and history while in alt screen so they stay in sync
@@ -463,6 +542,93 @@ impl Proxy {
             ALT_SCREEN_EXIT.len()
         } else {
             ALT_SCREEN_EXIT_LEGACY.len()
+        }
+    }
+
+    fn update_kitty_mode_from_output(&mut self, data: &[u8]) {
+        self.kitty_output_buffer.extend_from_slice(data);
+
+        let split_point = kitty_output_split_point(&self.kitty_output_buffer);
+
+        if split_point > 0 {
+            let to_parse: Vec<u8> = self.kitty_output_buffer.drain(..split_point).collect();
+            self.parse_kitty_output(&to_parse);
+        }
+
+        // Safety cap on carryover buffer
+        if self.kitty_output_buffer.len() > 64 {
+            let overflow: Vec<u8> = self.kitty_output_buffer.drain(..).collect();
+            self.parse_kitty_output(&overflow);
+        }
+    }
+
+    fn parse_kitty_output(&mut self, data: &[u8]) {
+        let mut i = 0;
+        while i < data.len() {
+            if data[i] == 0x1b && i + 3 < data.len() && data[i + 1] == b'[' {
+                if data[i + 2] == b'<' && data[i + 3] == b'u' {
+                    debug!("Kitty keyboard protocol disabled");
+                    self.kitty_mode_enabled = false;
+                    i += 4;
+                    continue;
+                }
+                if data[i + 2] == b'>' && self.kitty_mode_supported {
+                    let mut j = i + 3;
+                    while j < data.len() && data[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j > i + 3 && j < data.len() && data[j] == b'u' {
+                        debug!("Kitty keyboard protocol enabled");
+                        self.kitty_mode_enabled = true;
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    fn update_kitty_support_from_input(&mut self, data: &[u8]) {
+        if self.kitty_mode_supported {
+            return;
+        }
+
+        self.kitty_input_buffer.extend_from_slice(data);
+
+        let split_point = kitty_input_split_point(&self.kitty_input_buffer);
+
+        if split_point > 0 {
+            let to_parse: Vec<u8> = self.kitty_input_buffer.drain(..split_point).collect();
+            self.parse_kitty_input(&to_parse);
+        }
+
+        // Safety cap on carryover buffer
+        if self.kitty_input_buffer.len() > 64 {
+            let overflow: Vec<u8> = self.kitty_input_buffer.drain(..).collect();
+            self.parse_kitty_input(&overflow);
+        }
+    }
+
+    fn parse_kitty_input(&mut self, data: &[u8]) {
+        if self.kitty_mode_supported {
+            return;
+        }
+
+        let mut i = 0;
+        while i < data.len() {
+            if data[i] == 0x1b && i + 4 < data.len() && data[i + 1] == b'[' && data[i + 2] == b'?' {
+                let mut j = i + 3;
+                while j < data.len() && data[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > i + 3 && j < data.len() && data[j] == b'u' {
+                    debug!("Kitty keyboard protocol supported (saw query response)");
+                    self.kitty_mode_supported = true;
+                    return;
+                }
+            }
+            i += 1;
         }
     }
 
@@ -641,9 +807,17 @@ impl Proxy {
     fn process_input<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
         self.last_stdin_time = Some(Instant::now());
 
+        self.update_kitty_support_from_input(data);
+
         if self.in_alternate_screen {
             return write_all(&self.pty_master, data);
         }
+
+        let lookback_sequence = if self.kitty_mode_enabled {
+            self.config.lookback_sequence_kitty.clone()
+        } else {
+            self.config.lookback_sequence_legacy.clone()
+        };
 
         for &byte in data {
             if self.in_lookback_mode && byte == 0x03 {
@@ -655,13 +829,13 @@ impl Proxy {
             let lookback_action = self.check_sequence_match(
                 byte,
                 &mut self.lookback_input_buffer.clone(),
-                &self.config.lookback_sequence.clone(),
+                &lookback_sequence,
             );
 
             self.lookback_input_buffer.push(byte);
 
-            if self.lookback_input_buffer.len() > self.config.lookback_sequence.len() {
-                let excess = self.lookback_input_buffer.len() - self.config.lookback_sequence.len();
+            if self.lookback_input_buffer.len() > lookback_sequence.len() {
+                let excess = self.lookback_input_buffer.len() - lookback_sequence.len();
                 self.lookback_input_buffer.drain(..excess);
             }
 
@@ -677,11 +851,7 @@ impl Proxy {
                 }
                 SequenceMatch::Partial => {}
                 SequenceMatch::None => {
-                    if !self
-                        .config
-                        .lookback_sequence
-                        .starts_with(&self.lookback_input_buffer)
-                    {
+                    if !lookback_sequence.starts_with(&self.lookback_input_buffer) {
                         self.lookback_input_buffer.clear();
                     }
                 }
@@ -900,4 +1070,218 @@ fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
 
 fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
     read(fd.as_fd(), buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Tests for is_complete_kitty_output_seq
+
+    #[test]
+    fn test_output_seq_disable_complete() {
+        assert!(is_complete_kitty_output_seq(b"\x1b[<u"));
+    }
+
+    #[test]
+    fn test_output_seq_disable_with_trailing() {
+        assert!(is_complete_kitty_output_seq(b"\x1b[<uhello"));
+    }
+
+    #[test]
+    fn test_output_seq_enable_complete() {
+        assert!(is_complete_kitty_output_seq(b"\x1b[>1u"));
+    }
+
+    #[test]
+    fn test_output_seq_enable_multi_digit() {
+        assert!(is_complete_kitty_output_seq(b"\x1b[>31u"));
+    }
+
+    #[test]
+    fn test_output_seq_enable_with_trailing() {
+        assert!(is_complete_kitty_output_seq(b"\x1b[>1umore"));
+    }
+
+    #[test]
+    fn test_output_seq_incomplete_esc_only() {
+        assert!(!is_complete_kitty_output_seq(b"\x1b"));
+    }
+
+    #[test]
+    fn test_output_seq_incomplete_esc_bracket() {
+        assert!(!is_complete_kitty_output_seq(b"\x1b["));
+    }
+
+    #[test]
+    fn test_output_seq_incomplete_disable() {
+        assert!(!is_complete_kitty_output_seq(b"\x1b[<"));
+    }
+
+    #[test]
+    fn test_output_seq_incomplete_enable_no_digit() {
+        assert!(!is_complete_kitty_output_seq(b"\x1b[>"));
+    }
+
+    #[test]
+    fn test_output_seq_incomplete_enable_digit_no_u() {
+        assert!(!is_complete_kitty_output_seq(b"\x1b[>1"));
+    }
+
+    #[test]
+    fn test_output_seq_not_kitty() {
+        assert!(!is_complete_kitty_output_seq(b"\x1b[H"));
+        assert!(!is_complete_kitty_output_seq(b"\x1b[2J"));
+    }
+
+    #[test]
+    fn test_output_seq_empty() {
+        assert!(!is_complete_kitty_output_seq(b""));
+    }
+
+    #[test]
+    fn test_output_seq_no_esc() {
+        assert!(!is_complete_kitty_output_seq(b"hello"));
+    }
+
+    // Tests for is_complete_kitty_input_seq
+
+    #[test]
+    fn test_input_seq_query_response_complete() {
+        assert!(is_complete_kitty_input_seq(b"\x1b[?1u"));
+    }
+
+    #[test]
+    fn test_input_seq_query_response_multi_digit() {
+        assert!(is_complete_kitty_input_seq(b"\x1b[?31u"));
+    }
+
+    #[test]
+    fn test_input_seq_query_response_with_trailing() {
+        assert!(is_complete_kitty_input_seq(b"\x1b[?1umore"));
+    }
+
+    #[test]
+    fn test_input_seq_incomplete_esc_only() {
+        assert!(!is_complete_kitty_input_seq(b"\x1b"));
+    }
+
+    #[test]
+    fn test_input_seq_incomplete_esc_bracket() {
+        assert!(!is_complete_kitty_input_seq(b"\x1b["));
+    }
+
+    #[test]
+    fn test_input_seq_incomplete_esc_bracket_question() {
+        assert!(!is_complete_kitty_input_seq(b"\x1b[?"));
+    }
+
+    #[test]
+    fn test_input_seq_incomplete_no_u() {
+        assert!(!is_complete_kitty_input_seq(b"\x1b[?1"));
+    }
+
+    #[test]
+    fn test_input_seq_not_kitty() {
+        assert!(!is_complete_kitty_input_seq(b"\x1b[H"));
+        assert!(!is_complete_kitty_input_seq(b"\x1b[?25h"));
+    }
+
+    #[test]
+    fn test_input_seq_empty() {
+        assert!(!is_complete_kitty_input_seq(b""));
+    }
+
+    // Tests for kitty_output_split_point
+
+    #[test]
+    fn test_output_split_no_esc() {
+        assert_eq!(kitty_output_split_point(b"hello world"), 11);
+    }
+
+    #[test]
+    fn test_output_split_empty() {
+        assert_eq!(kitty_output_split_point(b""), 0);
+    }
+
+    #[test]
+    fn test_output_split_complete_disable() {
+        // Complete sequence - split at end (process all)
+        assert_eq!(kitty_output_split_point(b"\x1b[<u"), 4);
+    }
+
+    #[test]
+    fn test_output_split_complete_enable() {
+        assert_eq!(kitty_output_split_point(b"\x1b[>1u"), 5);
+    }
+
+    #[test]
+    fn test_output_split_incomplete_esc_only() {
+        // Just ESC - incomplete, split at 0 (keep all)
+        assert_eq!(kitty_output_split_point(b"\x1b"), 0);
+    }
+
+    #[test]
+    fn test_output_split_incomplete_enable() {
+        // Incomplete enable - split at ESC position
+        assert_eq!(kitty_output_split_point(b"\x1b[>"), 0);
+        assert_eq!(kitty_output_split_point(b"\x1b[>1"), 0);
+    }
+
+    #[test]
+    fn test_output_split_data_then_incomplete() {
+        // Data followed by incomplete - split before ESC
+        let data = b"hello\x1b[>";
+        assert_eq!(kitty_output_split_point(data), 5);
+    }
+
+    #[test]
+    fn test_output_split_complete_then_incomplete() {
+        // Complete disable followed by incomplete enable
+        let data = b"\x1b[<u\x1b[>";
+        assert_eq!(kitty_output_split_point(data), 4);
+    }
+
+    #[test]
+    fn test_output_split_esc_far_from_end() {
+        // ESC more than 16 bytes from end - process all
+        let mut data = b"\x1b[<u".to_vec();
+        data.extend_from_slice(b"this is padding longer than 16 bytes!");
+        assert_eq!(kitty_output_split_point(&data), data.len());
+    }
+
+    // Tests for kitty_input_split_point
+
+    #[test]
+    fn test_input_split_no_esc() {
+        assert_eq!(kitty_input_split_point(b"hello world"), 11);
+    }
+
+    #[test]
+    fn test_input_split_empty() {
+        assert_eq!(kitty_input_split_point(b""), 0);
+    }
+
+    #[test]
+    fn test_input_split_complete_query_response() {
+        assert_eq!(kitty_input_split_point(b"\x1b[?1u"), 5);
+    }
+
+    #[test]
+    fn test_input_split_incomplete() {
+        assert_eq!(kitty_input_split_point(b"\x1b[?"), 0);
+        assert_eq!(kitty_input_split_point(b"\x1b[?1"), 0);
+    }
+
+    #[test]
+    fn test_input_split_data_then_incomplete() {
+        let data = b"hello\x1b[?";
+        assert_eq!(kitty_input_split_point(data), 5);
+    }
+
+    #[test]
+    fn test_input_split_complete_then_incomplete() {
+        let data = b"\x1b[?1u\x1b[?";
+        assert_eq!(kitty_input_split_point(data), 5);
+    }
 }

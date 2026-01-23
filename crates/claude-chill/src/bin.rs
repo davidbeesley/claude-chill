@@ -4,6 +4,7 @@ use clap::Parser;
 use claude_chill::config::Config;
 use claude_chill::key_parser;
 use claude_chill::proxy::{Proxy, ProxyConfig};
+use log::debug;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -33,14 +34,24 @@ fn main() -> ExitCode {
         .clone()
         .unwrap_or_else(|| config.lookback_key.clone());
 
-    let lookback_sequence = match key_parser::parse(&lookback_key) {
-        Ok(key) => key.to_escape_sequence(),
+    let (lookback_sequence_legacy, lookback_sequence_kitty) = match key_parser::parse(&lookback_key)
+    {
+        Ok(key) => {
+            let legacy = key.to_escape_sequence();
+            let kitty = key.to_kitty_sequence().unwrap_or_else(|| legacy.clone());
+            (legacy, kitty)
+        }
         Err(e) => {
             eprintln!("Invalid lookback key '{}': {}", lookback_key, e);
             eprintln!("Using default: [ctrl][6]");
-            config.lookback_sequence()
+            (vec![0x1E], b"\x1b[54;5u".to_vec())
         }
     };
+
+    debug!(
+        "Lookback sequences: legacy={:?} kitty={:?}",
+        lookback_sequence_legacy, lookback_sequence_kitty
+    );
 
     let auto_lookback_timeout_ms = cli
         .auto_lookback_timeout
@@ -49,7 +60,8 @@ fn main() -> ExitCode {
     let proxy_config = ProxyConfig {
         max_history_lines: history_lines,
         lookback_key,
-        lookback_sequence,
+        lookback_sequence_legacy,
+        lookback_sequence_kitty,
         auto_lookback_timeout_ms,
     };
 

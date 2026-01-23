@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/davidbeesley/claude-chill/actions/workflows/ci.yml/badge.svg)](https://github.com/davidbeesley/claude-chill/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Version](https://img.shields.io/badge/version-0.1.2-blue)
 ![Linux](https://img.shields.io/badge/Linux-supported-green)
 ![macOS](https://img.shields.io/badge/macOS-supported-green)
 ![Windows](https://img.shields.io/badge/Windows-unsupported-red)
@@ -115,6 +116,12 @@ auto_lookback_timeout_ms = 15000 # Auto-lookback after 15s idle (0 to disable)
 ```
 
 Note: History is cleared on full screen redraws, so lookback shows output since Claude's last full render.
+
+### Kitty Keyboard Protocol
+
+Modern terminals like Kitty, Ghostty, and WezTerm support the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) which encodes keys differently than legacy terminals.
+
+claude-chill automatically tracks Kitty protocol state by monitoring the escape sequences passing through the proxy. When Claude Code enables Kitty mode, claude-chill switches to expecting Kitty-encoded key sequences for the lookback key. When Claude Code disables it, claude-chill switches back to legacy mode. This happens transparently with no configuration needed.
 
 ### Key Format
 
