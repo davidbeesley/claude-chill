@@ -89,6 +89,8 @@ claude-chill -H 50000 -a 0 -- claude --verbose
 
 Press `Ctrl+6` (or your configured key) to enter lookback mode:
 
+> **macOS Note:** Some Mac terminals don't send control characters for `Ctrl+number` keys.`Ctrl+Shift+6` (i.e., `Ctrl+^`) will work by default, or the lookback key can be customized.
+
 1. **Claude pauses** - Output from Claude is cached, input is blocked
 2. **History dumps** - The full history buffer is written to your terminal
 3. **Scroll freely** - Use your terminal's scrollback to review everything
@@ -135,7 +137,9 @@ Keys: `[a]`-`[z]`, `[f1]`-`[f12]`, `[pageup]`, `[pagedown]`, `[home]`, `[end]`, 
 
 ### Why Ctrl+6?
 
-`Ctrl+6` sends 0x1E, a control character not frequently used by terminals, signals, or shells. Avoid `Ctrl+letter` hotkeys - terminals can't distinguish `Ctrl+J` from `Ctrl+Shift+J`.
+`Ctrl+6` sends 0x1E (ASCII RS), a control character not frequently used by terminals, signals, or shells. Avoid `Ctrl+letter` hotkeys - terminals can't distinguish `Ctrl+J` from `Ctrl+Shift+J`.
+
+**macOS caveat:** Mac terminals don't send control characters for `Ctrl+number` combinations. On macOS, press `Ctrl+Shift+6` (equivalent to `Ctrl+^`) which produces the same 0x1E byte. A more portable default key may be chosen in a future release.
 
 ## How It Works
 
