@@ -100,9 +100,9 @@ When you exit lookback mode, any cached output is processed and the current stat
 
 ## Auto-Lookback
 
-After `auto_lookback_timeout_ms` (default 15 seconds) of idle (no user input), the full history is automatically dumped to your terminal so you can scroll back without pressing any keys. This continues to re-dump every `auto_lookback_timeout_ms` while idle. This is useful for reviewing Claude's output after it finishes working.
+After 15 seconds of idle (no user input), the full history is automatically dumped to your terminal so you can scroll back without pressing any keys. This continues to re-dump every 15 seconds while idle. This is useful for reviewing Claude's output after it finishes working.
 
-**Note:** The auto-lookback causes a brief screen flicker during the transition as it clears the screen and writes the history buffer. Disable with `-a 0` or adjust the timeout with `-a 30000` (30 seconds).
+**Note:** The auto-lookback causes a brief screen flicker during the transition as it clears the screen and writes the history buffer. Disable with `-a 0` or adjust the timeout with `-a 30000` (30 seconds). Configure via `auto_lookback_timeout_ms` in the config file or `--auto-lookback-timeout` on the command line.
 
 ## Configuration
 
