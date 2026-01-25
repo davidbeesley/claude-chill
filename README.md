@@ -14,7 +14,7 @@ A PTY proxy that tames Claude Code's massive terminal updates using VT-based ren
 
 Claude Code uses synchronized output to update the terminal atomically. It wraps output in sync markers (`\x1b[?2026h` ... `\x1b[?2026l`) so the terminal renders everything at once without flicker.
 
-The problem: Claude Code sends *entire* screen redraws in these sync blocks - often thousands of lines. Your terminal receives a 5000-line atomic update when only 20 lines are visible. This causes lag, flicker, and makes scrollback useless since each update clears history.
+The problem: Claude Code sends *entire* screen redraws in these sync blocks - often thousands of lines. Your terminal receives a 5000-line atomic update when only 20 lines are visible. This causes lag, flicker, or jitters in the terminal, making for a poor user experience.
 
 ## The Solution
 
