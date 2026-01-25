@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/davidbeesley/claude-chill/actions/workflows/ci.yml/badge.svg)](https://github.com/davidbeesley/claude-chill/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-0.1.2-blue)
+![Version](https://img.shields.io/badge/version-0.1.3-blue)
 ![Linux](https://img.shields.io/badge/Linux-supported-green)
 ![macOS](https://img.shields.io/badge/macOS-supported-green)
 ![Windows](https://img.shields.io/badge/Windows-unsupported-red)
