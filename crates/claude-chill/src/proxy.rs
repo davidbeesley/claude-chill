@@ -1327,10 +1327,7 @@ mod tests {
         assert_eq!(check_sequence(&[], b'a', sequence), SequenceMatch::None);
         assert_eq!(check_sequence(b"a", b'b', sequence), SequenceMatch::None);
         // Buffer [a, b, ESC] doesn't start sequence (sequence starts with ESC)
-        assert_eq!(
-            check_sequence(b"ab", 0x1b, sequence),
-            SequenceMatch::None
-        );
+        assert_eq!(check_sequence(b"ab", 0x1b, sequence), SequenceMatch::None);
         // After more typing, old bytes get trimmed from buffer
         // When buffer finally contains just ESC at the right position, it matches
         // But with rolling buffer, we need the EXACT prefix
