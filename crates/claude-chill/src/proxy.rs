@@ -1325,10 +1325,10 @@ mod tests {
         let sequence = b"\x1b[54;5u"; // 7 bytes
         // User types random chars - no match
         assert_eq!(check_sequence(&[], b'a', sequence), SequenceMatch::None);
-        assert_eq!(check_sequence(&[b'a'], b'b', sequence), SequenceMatch::None);
+        assert_eq!(check_sequence(b"a", b'b', sequence), SequenceMatch::None);
         // Buffer [a, b, ESC] doesn't start sequence (sequence starts with ESC)
         assert_eq!(
-            check_sequence(&[b'a', b'b'], 0x1b, sequence),
+            check_sequence(b"ab", 0x1b, sequence),
             SequenceMatch::None
         );
         // After more typing, old bytes get trimmed from buffer
@@ -1343,9 +1343,9 @@ mod tests {
         // User types "ab" then the lookback sequence
         let sequence = &[0x1E];
         assert_eq!(check_sequence(&[], b'a', sequence), SequenceMatch::None);
-        assert_eq!(check_sequence(&[b'a'], b'b', sequence), SequenceMatch::None);
+        assert_eq!(check_sequence(b"a", b'b', sequence), SequenceMatch::None);
         assert_eq!(
-            check_sequence(&[b'a', b'b'], 0x1E, sequence),
+            check_sequence(b"ab", 0x1E, sequence),
             SequenceMatch::Complete
         );
     }
