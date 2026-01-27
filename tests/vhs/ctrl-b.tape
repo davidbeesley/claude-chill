@@ -4,7 +4,9 @@
 # In Emacs and many terminals, Ctrl-B is the standard keybinding for
 # moving the cursor one character to the left.
 #
-# EXPECTED: This test should FAIL until issue #27 is resolved.
+# NOTE: This test passes in a regular terminal. The issue #27 is specific
+# to Emacs vterm. We need to investigate what vterm does differently
+# (possibly using Kitty keyboard protocol or other escape sequences).
 
 Output tests/vhs/output/ctrl-b.ascii
 
