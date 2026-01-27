@@ -1,0 +1,71 @@
+#!/usr/bin/expect -f
+#
+# Test for issue #27: Ctrl-B cursor movement
+#
+# This test verifies that Ctrl-B (0x02) is correctly passed through
+# to bash/readline for cursor movement.
+#
+
+set timeout 5
+set binary [lindex $argv 0]
+if {$binary eq ""} {
+    set binary "./target/debug/claude-chill"
+}
+
+set env(PS1) "TEST> "
+set env(TERM) "xterm-256color"
+set env(BASH_SILENCE_DEPRECATION_WARNING) "1"
+
+proc fail {msg} {
+    puts "\n\033\[31mFAIL: $msg\033\[0m"
+    exit 1
+}
+
+proc pass {msg} {
+    puts "\033\[32mPASS: $msg\033\[0m"
+}
+
+# Build if needed
+if {![file exists $binary]} {
+    puts "Building..."
+    if {[catch {exec cargo build 2>@1}]} {
+        fail "cargo build failed"
+    }
+}
+
+puts "Testing Ctrl-B (issue #27)"
+puts "Using binary: $binary"
+puts ""
+
+spawn $binary -- /bin/bash --norc --noprofile
+expect "TEST> "
+
+# Type some text
+send "echo ABCDEF"
+sleep 0.1
+
+# Send Ctrl-B twice to move cursor back 2 positions
+# Ctrl-B = 0x02
+send "\x02"
+sleep 0.1
+send "\x02"
+sleep 0.1
+
+# Type X - should insert at cursor position
+send "X"
+sleep 0.1
+
+# Press Enter
+send "\r"
+
+# Check the output
+expect {
+    "ABCDXEF" { pass "Ctrl-B cursor movement works!" }
+    "ABCDEFX" { fail "Ctrl-B did NOT move cursor - X was appended instead of inserted" }
+    timeout { fail "timeout waiting for output" }
+}
+
+send "exit\r"
+expect eof
+
+exit 0
