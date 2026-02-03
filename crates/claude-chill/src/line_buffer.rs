@@ -44,6 +44,20 @@ impl LineBuffer {
         self.cached_bytes = 0;
     }
 
+    /// Truncate history to keep only the first n lines.
+    /// Used to remove content since last full redraw before adding new content.
+    pub fn truncate_to_lines(&mut self, n: usize) {
+        // Clear current partial line
+        self.current_line.clear();
+
+        // Remove lines from the back until we have at most n lines
+        while self.lines.len() > n {
+            if let Some(removed) = self.lines.pop_back() {
+                self.cached_bytes -= removed.len() + 1;
+            }
+        }
+    }
+
     pub fn line_count(&self) -> usize {
         self.lines.len() + if self.current_line.is_empty() { 0 } else { 1 }
     }

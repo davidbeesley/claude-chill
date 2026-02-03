@@ -119,6 +119,7 @@ pub struct Proxy {
     lookback_cache: Vec<u8>,
     lookback_input_buffer: Vec<u8>,
     output_buffer: Vec<u8>,
+    last_redraw_line_count: usize,
     sync_start_finder: memmem::Finder<'static>,
     sync_end_finder: memmem::Finder<'static>,
     clear_screen_finder: memmem::Finder<'static>,
@@ -293,6 +294,7 @@ impl Proxy {
             lookback_cache: Vec::new(),
             lookback_input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
             output_buffer: Vec::with_capacity(OUTPUT_BUFFER_CAPACITY),
+            last_redraw_line_count: 0,
             sync_start_finder: memmem::Finder::new(SYNC_START),
             sync_end_finder: memmem::Finder::new(SYNC_END),
             clear_screen_finder: memmem::Finder::new(CLEAR_SCREEN),
@@ -628,20 +630,19 @@ impl Proxy {
         let has_cursor_home = self.cursor_home_finder.find(&self.sync_buffer).is_some();
         let is_full_redraw = has_clear_screen && has_cursor_home;
 
-        debug!(
-            "flush_sync_block: len={} full_redraw={}",
-            self.sync_buffer.len(),
-            is_full_redraw
-        );
+        if is_full_redraw {
+            // Truncate history to remove content since last full redraw
+            // This prevents duplicate content when screen is redrawn
+            self.history.truncate_to_lines(self.last_redraw_line_count);
+        }
+
+        self.push_to_history(&self.sync_buffer.clone());
 
         if is_full_redraw {
-            debug!("CLEARING HISTORY");
-            self.history.clear();
-            // Re-seed with clear screen after clearing
-            self.history.push_bytes(CLEAR_SCREEN);
-            self.history.push_bytes(CURSOR_HOME);
+            // Remember current line count for next redraw
+            self.last_redraw_line_count = self.history.line_count();
         }
-        self.push_to_history(&self.sync_buffer.clone());
+
         self.sync_buffer.clear();
     }
 
