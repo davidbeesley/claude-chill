@@ -76,6 +76,17 @@ jobs:
             exit 1
           fi
 
+  nix-build:
+    name: Nix Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build with Nix
+        run: nix build .#claude-chill
+
   integration:
     name: Integration Tests
     strategy:
