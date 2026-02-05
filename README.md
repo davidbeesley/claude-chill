@@ -160,6 +160,30 @@ claude-chill creates a pseudo-terminal (PTY) and spawns Claude Code as a child p
 5. **History tracking**: Maintains a buffer of output for lookback mode since the last full redraw
 6. **Signal forwarding**: Window resize (SIGWINCH), interrupt (SIGINT), and terminate (SIGTERM) signals are forwarded to Claude
 
+## Installation with Nix
+
+### Any System (Linux / MacOS)
+
+```bash
+# Install directly from GitHub
+nix profile install github:davidbeesley/claude-chill
+
+# Or run without installing
+nix run github:davidbeesley/claude-chill -- --help
+```
+
+### NixOS
+
+Add the following to your `flake.nix`:
+```nix
+inputs.claude-chill.url = "github:davidbeesley/claude-chill";
+```
+
+And then the following package to your environment.systemPackages or home.packages:
+```nix
+inputs.claude-chill.packages.${system}.default
+```
+
 ## Disclaimer
 
 This tool was developed for personal convenience. It works for me on Linux and macOS, but it hasn't been extensively tested across different terminals or edge cases. Don't use it to send anyone to space, perform surgery, or run critical infrastructure. If it breaks, you get to keep both pieces.
