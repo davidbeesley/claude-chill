@@ -21,7 +21,9 @@
             src = ./.;
             filter = path: type: !(pkgs.lib.hasSuffix ".nix" path);
           };
-          cargoHash = "sha256-mLiOFdIRluTOahLF29by6D+JuHfUW9VRCHNpLxKiIvE=";
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+          };
         };
 
       in
