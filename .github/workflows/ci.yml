@@ -93,3 +93,14 @@ jobs:
         run: command -v expect || brew install expect
       - run: cargo build
       - run: expect tests/integration.exp
+
+  nix-build:
+    name: Nix Build
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - run: nix build .# -L
