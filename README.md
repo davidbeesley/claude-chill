@@ -28,6 +28,12 @@ claude-chill sits between your terminal and Claude Code:
 ## Installation
 
 ```bash
+cargo install --git https://github.com/davidbeesley/claude-chill
+```
+
+Or, if you've cloned the repository locally:
+
+```bash
 cargo install --path crates/claude-chill
 ```
 
