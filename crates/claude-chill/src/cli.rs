@@ -27,4 +27,8 @@ pub struct Cli {
     /// Auto-lookback timeout in ms, 0 to disable (default: 15000)
     #[arg(short = 'a', long = "auto-lookback-timeout")]
     pub auto_lookback_timeout: Option<u64>,
+
+    /// Keys to exit lookback mode, comma-separated (default: "[q],[esc]")
+    #[arg(short = 'e', long = "lookback-exit-keys", value_delimiter = ',')]
+    pub lookback_exit_keys: Option<Vec<String>>,
 }

@@ -7,11 +7,17 @@ const DEFAULT_LOOKBACK_KEY: &str = "[ctrl][6]";
 const DEFAULT_REFRESH_RATE: u64 = 20;
 const DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS: u64 = 15000;
 
+fn default_lookback_exit_keys() -> Vec<String> {
+    vec!["[q]".to_string(), "[esc]".to_string()]
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub history_lines: usize,
     pub lookback_key: String,
+    #[serde(default = "default_lookback_exit_keys")]
+    pub lookback_exit_keys: Vec<String>,
     pub refresh_rate: u64,
     pub auto_lookback_timeout_ms: u64,
 }
@@ -21,6 +27,7 @@ impl Default for Config {
         Self {
             history_lines: 100_000,
             lookback_key: DEFAULT_LOOKBACK_KEY.to_string(),
+            lookback_exit_keys: default_lookback_exit_keys(),
             refresh_rate: DEFAULT_REFRESH_RATE,
             auto_lookback_timeout_ms: DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS,
         }
@@ -66,6 +73,19 @@ impl Config {
 
     pub fn parse_lookback_key(&self) -> Result<KeyCombination, key_parser::ParseKeyError> {
         key_parser::parse(&self.lookback_key)
+    }
+
+    pub fn parse_lookback_exit_keys(&self) -> Vec<KeyCombination> {
+        self.lookback_exit_keys
+            .iter()
+            .filter_map(|k| match key_parser::parse(k) {
+                Ok(key) => Some(key),
+                Err(e) => {
+                    eprintln!("Warning: Invalid lookback_exit_key '{}': {}", k, e);
+                    None
+                }
+            })
+            .collect()
     }
 
     pub fn lookback_sequence(&self) -> Vec<u8> {

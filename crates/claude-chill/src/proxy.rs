@@ -1,7 +1,8 @@
 use crate::escape_sequences::{
     ALT_SCREEN_ENTER, ALT_SCREEN_ENTER_LEGACY, ALT_SCREEN_EXIT, ALT_SCREEN_EXIT_LEGACY,
-    CLEAR_SCREEN, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY, SYNC_BUFFER_CAPACITY,
-    SYNC_END, SYNC_START,
+    BRACKETED_PASTE_DISABLE, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_END, BRACKETED_PASTE_START,
+    CLEAR_SCREEN, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY,
+    SYNC_BUFFER_CAPACITY, SYNC_END, SYNC_START,
 };
 use crate::history_filter::HistoryFilter;
 use crate::line_buffer::LineBuffer;
@@ -53,6 +54,8 @@ pub struct ProxyConfig {
     pub lookback_key: String,
     pub lookback_sequence_legacy: Vec<u8>,
     pub lookback_sequence_kitty: Vec<u8>,
+    pub lookback_exit_sequences: Vec<Vec<u8>>,
+    pub lookback_exit_keys_display: Vec<String>,
     pub auto_lookback_timeout_ms: u64,
 }
 
@@ -63,6 +66,8 @@ impl Default for ProxyConfig {
             lookback_key: "[ctrl][6]".to_string(),
             lookback_sequence_legacy: vec![0x1E],
             lookback_sequence_kitty: b"\x1b[54;5u".to_vec(),
+            lookback_exit_sequences: vec![vec![b'q'], vec![0x1b]],
+            lookback_exit_keys_display: vec!["q".to_string(), "Esc".to_string()],
             auto_lookback_timeout_ms: 15000,
         }
     }
@@ -112,6 +117,7 @@ pub struct Proxy {
     in_sync_block: bool,
     in_lookback_mode: bool,
     in_alternate_screen: bool,
+    in_bracketed_paste: bool,
     kitty_mode_supported: bool,
     kitty_mode_stack: u32,
     kitty_output_parser: TermwizParser,
@@ -127,6 +133,8 @@ pub struct Proxy {
     alt_screen_exit_finder: memmem::Finder<'static>,
     alt_screen_enter_legacy_finder: memmem::Finder<'static>,
     alt_screen_exit_legacy_finder: memmem::Finder<'static>,
+    paste_start_finder: memmem::Finder<'static>,
+    paste_end_finder: memmem::Finder<'static>,
 }
 
 /// Returns (supported, initial_flags) - if flags > 0, terminal is already in Kitty mode
@@ -257,6 +265,13 @@ impl Proxy {
         drop(pty.slave);
         set_nonblocking(&pty.master)?;
 
+        // Enable bracketed paste on the real terminal so tmux/Ghostty wraps
+        // paste content in \x1b[200~ ... \x1b[201~ markers. Without this,
+        // the child app's \x1b[?2004h gets eaten by the VT renderer before
+        // it reaches the terminal, and pastes arrive as plain keystrokes.
+        let stdout_fd = io::stdout();
+        write_all(&stdout_fd, BRACKETED_PASTE_ENABLE)?;
+
         let vt_parser = vt100::Parser::new(winsize.ws_row, winsize.ws_col, 0);
 
         // Seed history with clear screen so replay starts fresh
@@ -286,6 +301,7 @@ impl Proxy {
             in_sync_block: false,
             in_lookback_mode: false,
             in_alternate_screen: false,
+            in_bracketed_paste: false,
             kitty_mode_supported: kitty_supported,
             kitty_mode_stack: kitty_initial_stack,
             kitty_output_parser: TermwizParser::new(),
@@ -301,6 +317,8 @@ impl Proxy {
             alt_screen_exit_finder: memmem::Finder::new(ALT_SCREEN_EXIT),
             alt_screen_enter_legacy_finder: memmem::Finder::new(ALT_SCREEN_ENTER_LEGACY),
             alt_screen_exit_legacy_finder: memmem::Finder::new(ALT_SCREEN_EXIT_LEGACY),
+            paste_start_finder: memmem::Finder::new(BRACKETED_PASTE_START),
+            paste_end_finder: memmem::Finder::new(BRACKETED_PASTE_END),
         })
     }
 
@@ -821,12 +839,60 @@ impl Proxy {
     fn process_input<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
         self.last_stdin_time = Some(Instant::now());
 
-        debug!("process_input: stdin={:?}", data);
+        debug!("process_input: stdin={:?} paste={}", data, self.in_bracketed_paste);
 
+        // In alternate screen, forward directly with deadlock prevention
         if self.in_alternate_screen {
-            return write_all(&self.pty_master, data);
+            return write_to_pty_draining(&self.pty_master, data, stdout_fd);
         }
 
+        // In bracketed paste, forward directly until paste end marker
+        if self.in_bracketed_paste {
+            if let Some(pos) = self.paste_end_finder.find(data) {
+                let end = pos + BRACKETED_PASTE_END.len();
+                write_to_pty_draining(&self.pty_master, &data[..end], stdout_fd)?;
+                self.in_bracketed_paste = false;
+                debug!("process_input: bracketed paste ended");
+                if end < data.len() {
+                    return self.process_input(&data[end..], stdout_fd);
+                }
+                return Ok(());
+            }
+            return write_to_pty_draining(&self.pty_master, data, stdout_fd);
+        }
+
+        // Check for bracketed paste start
+        if let Some(pos) = self.paste_start_finder.find(data) {
+            debug!("process_input: bracketed paste started");
+            // Process any data before paste start through normal lookback matching
+            if pos > 0 {
+                self.process_input_lookback(&data[..pos], stdout_fd)?;
+            }
+            self.in_bracketed_paste = true;
+            let paste_data = &data[pos..];
+            // Check if paste end is in same chunk
+            let search_start = BRACKETED_PASTE_START.len();
+            if paste_data.len() > search_start {
+                if let Some(end_pos) = self.paste_end_finder.find(&paste_data[search_start..]) {
+                    let end = search_start + end_pos + BRACKETED_PASTE_END.len();
+                    write_to_pty_draining(&self.pty_master, &paste_data[..end], stdout_fd)?;
+                    self.in_bracketed_paste = false;
+                    debug!("process_input: bracketed paste ended (same chunk)");
+                    if end < paste_data.len() {
+                        return self.process_input(&paste_data[end..], stdout_fd);
+                    }
+                    return Ok(());
+                }
+            }
+            return write_to_pty_draining(&self.pty_master, paste_data, stdout_fd);
+        }
+
+        self.process_input_lookback(data, stdout_fd)
+    }
+
+    /// Byte-by-byte input processing with lookback sequence matching.
+    /// Only used for normal (non-paste, non-alt-screen) input.
+    fn process_input_lookback<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
         let lookback_sequence = if self.kitty_mode_enabled() {
             self.config.lookback_sequence_kitty.clone()
         } else {
@@ -834,7 +900,14 @@ impl Proxy {
         };
 
         for &byte in data {
-            if self.in_lookback_mode && byte == 0x03 {
+            if self.in_lookback_mode
+                && (byte == 0x03
+                    || self
+                        .config
+                        .lookback_exit_sequences
+                        .iter()
+                        .any(|seq| seq.len() == 1 && seq[0] == byte))
+            {
                 self.lookback_input_buffer.clear();
                 self.exit_lookback_mode(stdout_fd)?;
                 continue;
@@ -921,9 +994,17 @@ impl Proxy {
         write_all(&stdout_fd, CURSOR_HOME)?;
         write_all(&stdout_fd, &self.output_buffer)?;
 
+        let exit_keys_str = if self.config.lookback_exit_keys_display.is_empty() {
+            format!("{} or Ctrl+C", self.config.lookback_key)
+        } else {
+            let mut keys: Vec<String> = vec![self.config.lookback_key.clone()];
+            keys.extend(self.config.lookback_exit_keys_display.clone());
+            keys.push("Ctrl+C".to_string());
+            keys.join(", ")
+        };
         let exit_msg = format!(
-            "\r\n\x1b[7m--- LOOKBACK MODE: press {} or Ctrl+C to exit ---\x1b[0m\r\n",
-            self.config.lookback_key
+            "\r\n\x1b[7m--- LOOKBACK MODE: press {} to exit ---\x1b[0m\r\n",
+            exit_keys_str
         );
         write_all(&stdout_fd, exit_msg.as_bytes())?;
 
@@ -1000,6 +1081,10 @@ impl Proxy {
 
 impl Drop for Proxy {
     fn drop(&mut self) {
+        // Disable bracketed paste before restoring terminal
+        let stdout_fd = io::stdout();
+        let _ = write_all(&stdout_fd, BRACKETED_PASTE_DISABLE);
+
         if let Some(ref termios) = self.original_termios {
             let _ = tcsetattr(io::stdin(), SetArg::TCSANOW, termios);
         }
@@ -1078,6 +1163,41 @@ fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
             Ok(n) => written += n,
             Err(Errno::EAGAIN) | Err(Errno::EINTR) => continue,
             Err(e) => anyhow::bail!("write failed: {}", e),
+        }
+    }
+    Ok(())
+}
+
+/// Write data to the pty master, draining child output to stdout when the
+/// pty buffer is full. This prevents the classic pty deadlock where both
+/// sides block on full buffers (stdin→pty blocks because pty buffer is full,
+/// child→pty blocks because its output buffer is also full).
+fn write_to_pty_draining<P: AsFd, S: AsFd>(pty: &P, data: &[u8], stdout_fd: &S) -> Result<()> {
+    let mut written = 0;
+    let mut drain_buf = [0u8; 65536];
+
+    while written < data.len() {
+        match write(pty, &data[written..]) {
+            Ok(n) => written += n,
+            Err(Errno::EAGAIN) => {
+                // PTY buffer full — drain child output to make room
+                match nix_read(pty, &mut drain_buf) {
+                    Ok(n) if n > 0 => {
+                        // Pass child output straight to the terminal
+                        write_all(stdout_fd, &drain_buf[..n])?;
+                    }
+                    _ => {
+                        // Nothing available yet, poll briefly
+                        let mut poll_fds = [PollFd::new(
+                            pty.as_fd(),
+                            PollFlags::POLLIN | PollFlags::POLLOUT,
+                        )];
+                        let _ = poll(&mut poll_fds, PollTimeout::from(10u16));
+                    }
+                }
+            }
+            Err(Errno::EINTR) => continue,
+            Err(e) => anyhow::bail!("write to pty failed: {}", e),
         }
     }
     Ok(())

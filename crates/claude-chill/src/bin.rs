@@ -57,11 +57,36 @@ fn main() -> ExitCode {
         .auto_lookback_timeout
         .unwrap_or(config.auto_lookback_timeout_ms);
 
+    let exit_keys_raw = cli
+        .lookback_exit_keys
+        .unwrap_or_else(|| config.lookback_exit_keys.clone());
+
+    let mut lookback_exit_sequences = Vec::new();
+    let mut lookback_exit_keys_display = Vec::new();
+    for key_str in &exit_keys_raw {
+        match key_parser::parse(key_str) {
+            Ok(key) => {
+                lookback_exit_sequences.push(key.to_escape_sequence());
+                lookback_exit_keys_display.push(key.to_string());
+            }
+            Err(e) => {
+                eprintln!("Warning: Invalid lookback_exit_key '{}': {}", key_str, e);
+            }
+        }
+    }
+
+    debug!(
+        "Lookback exit sequences: {:?}",
+        lookback_exit_sequences
+    );
+
     let proxy_config = ProxyConfig {
         max_history_lines: history_lines,
         lookback_key,
         lookback_sequence_legacy,
         lookback_sequence_kitty,
+        lookback_exit_sequences,
+        lookback_exit_keys_display,
         auto_lookback_timeout_ms,
     };
 
