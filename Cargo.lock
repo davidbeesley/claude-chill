@@ -751,6 +751,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pty-mock"
+version = "0.1.4"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/claude-chill",
+    "crates/pty-mock",
 ]
 
 [workspace.package]

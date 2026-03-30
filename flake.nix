@@ -24,6 +24,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
+          cargoBuildFlags = [ "-p" "claude-chill" ];
         };
 
       in

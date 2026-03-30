@@ -2,6 +2,8 @@ pub mod config;
 pub mod escape_filter;
 pub mod escape_sequences;
 pub mod history_filter;
+#[cfg(test)]
+mod integration_tests;
 pub mod key_parser;
 pub mod line_buffer;
 pub mod proxy;

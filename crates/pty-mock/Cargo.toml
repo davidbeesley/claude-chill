@@ -1,0 +1,12 @@
+[package]
+name = "pty-mock"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "pty-mock"
+path = "src/bin.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }

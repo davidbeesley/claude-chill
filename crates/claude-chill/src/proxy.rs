@@ -322,6 +322,105 @@ impl Proxy {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        pty_master: OwnedFd,
+        child: Child,
+        config: ProxyConfig,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
+        let vt_parser = vt100::Parser::new(rows, cols, 0);
+        let mut history = LineBuffer::new(config.max_history_lines);
+        history.push_bytes(CLEAR_SCREEN);
+        history.push_bytes(CURSOR_HOME);
+        let auto_lookback_timeout = Duration::from_millis(config.auto_lookback_timeout_ms);
+
+        Self {
+            history,
+            history_filter: HistoryFilter::new(),
+            config,
+            pty_master,
+            child,
+            original_termios: None,
+            vt_parser,
+            vt_prev_screen: None,
+            last_output_time: None,
+            last_render_time: None,
+            last_stdin_time: None,
+            last_auto_lookback_time: None,
+            auto_lookback_timeout,
+            sync_buffer: Vec::with_capacity(SYNC_BUFFER_CAPACITY),
+            in_sync_block: false,
+            in_lookback_mode: false,
+            in_alternate_screen: false,
+            in_bracketed_paste: false,
+            kitty_mode_supported: false,
+            kitty_mode_stack: 0,
+            kitty_output_parser: TermwizParser::new(),
+            vt_render_pending: false,
+            lookback_cache: Vec::new(),
+            lookback_input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
+            output_buffer: Vec::with_capacity(OUTPUT_BUFFER_CAPACITY),
+            sync_start_finder: memmem::Finder::new(SYNC_START),
+            sync_end_finder: memmem::Finder::new(SYNC_END),
+            clear_screen_finder: memmem::Finder::new(CLEAR_SCREEN),
+            cursor_home_finder: memmem::Finder::new(CURSOR_HOME),
+            alt_screen_enter_finder: memmem::Finder::new(ALT_SCREEN_ENTER),
+            alt_screen_exit_finder: memmem::Finder::new(ALT_SCREEN_EXIT),
+            alt_screen_enter_legacy_finder: memmem::Finder::new(ALT_SCREEN_ENTER_LEGACY),
+            alt_screen_exit_legacy_finder: memmem::Finder::new(ALT_SCREEN_EXIT_LEGACY),
+            paste_start_finder: memmem::Finder::new(BRACKETED_PASTE_START),
+            paste_end_finder: memmem::Finder::new(BRACKETED_PASTE_END),
+            pty_drain_buffer: Vec::new(),
+            paste_remainder: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history(&self) -> &LineBuffer {
+        &self.history
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_in_alternate_screen(&self) -> bool {
+        self.in_alternate_screen
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_in_bracketed_paste(&self) -> bool {
+        self.in_bracketed_paste
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_in_sync_block(&self) -> bool {
+        self.in_sync_block
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_in_lookback_mode(&self) -> bool {
+        self.in_lookback_mode
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vt_screen_text(&self) -> String {
+        self.vt_parser.screen().contents()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pty_master_fd_raw(&self) -> i32 {
+        self.pty_master.as_raw_fd()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flush_drain_buffer<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        if !self.pty_drain_buffer.is_empty() {
+            let drained = std::mem::take(&mut self.pty_drain_buffer);
+            self.process_output(&drained, stdout_fd)?;
+        }
+        Ok(())
+    }
+
     pub fn run(&mut self) -> Result<i32> {
         let stdin_fd = io::stdin();
         let stdout_fd = io::stdout();
@@ -406,7 +505,7 @@ impl Proxy {
         self.wait_child()
     }
 
-    fn process_output<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
+    pub(crate) fn process_output<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
         self.process_output_inner(data, stdout_fd, true)
     }
 
@@ -425,12 +524,10 @@ impl Proxy {
         );
 
         if self.in_alternate_screen {
-            // Feed VT but NOT history while in alt screen
-            // Alt screen content (TUI editors, etc.) shouldn't be in lookback history
-            if feed_vt {
-                self.vt_parser.process(data);
-            }
-            return self.process_output_alt_screen(data, stdout_fd);
+            // Don't feed VT upfront - process_output_alt_screen feeds incrementally
+            // so we can render the clean restored main buffer at alt exit before
+            // any post-exit data (like clear screen + redraw) modifies it
+            return self.process_output_alt_screen(data, stdout_fd, feed_vt);
         }
 
         if self.in_lookback_mode {
@@ -440,8 +537,16 @@ impl Proxy {
         }
 
         // Feed data to VT emulator (unless already fed by caller)
+        // If there's an alt screen enter, only feed up to it - the alt screen
+        // handler feeds the rest incrementally to avoid processing past
+        // a potential alt exit before rendering
         if feed_vt {
-            self.vt_parser.process(data);
+            if let Some(enter_pos) = self.find_alt_screen_enter(data) {
+                let seq_len = self.alt_screen_enter_len(&data[enter_pos..]);
+                self.vt_parser.process(&data[..enter_pos + seq_len]);
+            } else {
+                self.vt_parser.process(data);
+            }
         }
         self.vt_render_pending = true;
         self.last_output_time = Some(Instant::now());
@@ -469,7 +574,13 @@ impl Proxy {
                 let seq_len = self.alt_screen_enter_len(&data[pos + alt_pos..]);
                 // Write alt screen enter directly
                 self.write_to_terminal(stdout_fd, &data[pos + alt_pos..pos + alt_pos + seq_len])?;
-                return self.process_output_alt_screen(&data[pos + alt_pos + seq_len..], stdout_fd);
+                // VT was only fed up to the alt enter; the alt screen handler
+                // will feed the rest incrementally
+                return self.process_output_alt_screen(
+                    &data[pos + alt_pos + seq_len..],
+                    stdout_fd,
+                    true,
+                );
             }
 
             if self.in_sync_block {
@@ -504,15 +615,29 @@ impl Proxy {
         Ok(())
     }
 
-    fn process_output_alt_screen<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
+    fn process_output_alt_screen<F: AsFd>(
+        &mut self,
+        data: &[u8],
+        stdout_fd: &F,
+        feed_vt: bool,
+    ) -> Result<()> {
         if let Some(exit_pos) = self.find_alt_screen_exit(data) {
             debug!(
                 "process_output_alt_screen: ALT_SCREEN_EXIT detected at pos={}",
                 exit_pos
             );
-            self.write_to_terminal(stdout_fd, &data[..exit_pos])?;
             let seq_len = self.alt_screen_exit_len(&data[exit_pos..]);
-            self.write_to_terminal(stdout_fd, &data[exit_pos..exit_pos + seq_len])?;
+            let alt_end = exit_pos + seq_len;
+
+            // Feed VT parser ONLY up to and including the alt exit sequence.
+            // This restores the main screen buffer cleanly without any post-exit
+            // data (like clear screen + redraw) clobbering the restored content.
+            if feed_vt {
+                self.vt_parser.process(&data[..alt_end]);
+            }
+
+            self.write_to_terminal(stdout_fd, &data[..exit_pos])?;
+            self.write_to_terminal(stdout_fd, &data[exit_pos..alt_end])?;
             self.in_alternate_screen = false;
 
             // Force full VT render to restore main screen content
@@ -520,34 +645,20 @@ impl Proxy {
             self.vt_prev_screen = None;
             self.render_vt_screen(stdout_fd)?;
 
-            // Data after ALT_EXIT was already fed to VT and history when we processed
-            // the alt screen chunk, so we just need to check for more alt screen transitions
-            let remaining = &data[exit_pos + seq_len..];
+            // Process remaining data through the normal pipeline so it gets
+            // proper VT feeding, history tracking, and sync block handling
+            let remaining = &data[alt_end..];
             if !remaining.is_empty() {
-                // Check if there's another alt screen enter in the remaining data
-                if self.find_alt_screen_enter(remaining).is_some() {
-                    // Need to process for alt screen detection, but skip VT/history feed
-                    return self.process_output_check_alt_only(remaining, stdout_fd);
-                }
+                return self.process_output_inner(remaining, stdout_fd, feed_vt);
             }
             return Ok(());
         }
-        self.write_to_terminal(stdout_fd, data)
-    }
 
-    /// Check for alt screen transitions without re-feeding VT/history
-    fn process_output_check_alt_only<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
-        if let Some(alt_pos) = self.find_alt_screen_enter(data) {
-            debug!(
-                "process_output_check_alt_only: ALT_SCREEN_ENTER at pos={}",
-                alt_pos
-            );
-            self.in_alternate_screen = true;
-            let seq_len = self.alt_screen_enter_len(&data[alt_pos..]);
-            self.write_to_terminal(stdout_fd, &data[alt_pos..alt_pos + seq_len])?;
-            return self.process_output_alt_screen(&data[alt_pos + seq_len..], stdout_fd);
+        // No exit found - feed VT and write through to terminal
+        if feed_vt {
+            self.vt_parser.process(data);
         }
-        Ok(())
+        self.write_to_terminal(stdout_fd, data)
     }
 
     fn find_alt_screen_enter(&self, data: &[u8]) -> Option<usize> {
@@ -842,7 +953,7 @@ impl Proxy {
         Ok(())
     }
 
-    fn process_input<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
+    pub(crate) fn process_input<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
         self.last_stdin_time = Some(Instant::now());
 
         debug!(

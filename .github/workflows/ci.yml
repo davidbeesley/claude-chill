@@ -63,6 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build -p pty-mock
       - run: cargo test --all-targets
 
   test:
