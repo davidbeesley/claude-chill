@@ -5,7 +5,7 @@
 ![Version](https://img.shields.io/badge/version-0.1.4-blue)
 ![Linux](https://img.shields.io/badge/Linux-supported-green)
 ![macOS](https://img.shields.io/badge/macOS-supported-green)
-![Windows](https://img.shields.io/badge/Windows-unsupported-red)
+![Windows](https://img.shields.io/badge/Windows-supported-green)
 ![Rust](https://img.shields.io/badge/rust-2024-orange)
 
 A PTY proxy that tames Claude Code's massive terminal updates using VT-based rendering.
@@ -26,6 +26,22 @@ claude-chill sits between your terminal and Claude Code:
 4. **Enables lookback** - Press a key to pause Claude and view the full history buffer
 
 ## Installation
+
+### Pre-built Binaries
+
+Download the latest release for your platform from [GitHub Releases](https://github.com/davidbeesley/claude-chill/releases):
+
+| Platform | Download |
+|----------|----------|
+| Linux (x86_64) | `claude-chill-linux-x86_64.tar.gz` |
+| Linux (aarch64) | `claude-chill-linux-aarch64.tar.gz` |
+| macOS (Intel) | `claude-chill-macos-x86_64.tar.gz` |
+| macOS (Apple Silicon) | `claude-chill-macos-aarch64.tar.gz` |
+| Windows (x86_64) | `claude-chill-windows-x86_64.zip` |
+
+Extract and place the binary in your PATH.
+
+### From Source (requires Rust)
 
 ```bash
 cargo install --git https://github.com/davidbeesley/claude-chill
@@ -115,6 +131,7 @@ After `auto_lookback_timeout_ms` (default 15 seconds) of idle (no user input), t
 Config file location:
 - **Linux**: `~/.config/claude-chill.toml`
 - **macOS**: `~/Library/Application Support/claude-chill.toml`
+- **Windows**: `%APPDATA%\claude-chill.toml`
 
 ```toml
 history_lines = 100000           # Max lines stored for lookback
@@ -149,7 +166,7 @@ Keys: `[a]`-`[z]`, `[f1]`-`[f12]`, `[pageup]`, `[pagedown]`, `[home]`, `[end]`, 
 
 ## How It Works
 
-claude-chill creates a pseudo-terminal (PTY) and spawns Claude Code as a child process. It then acts as a transparent proxy between your terminal and Claude:
+claude-chill creates a pseudo-terminal (PTY on Unix, ConPTY on Windows) and spawns Claude Code as a child process. It then acts as a transparent proxy between your terminal and Claude:
 
 ```
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
@@ -164,7 +181,7 @@ claude-chill creates a pseudo-terminal (PTY) and spawns Claude Code as a child p
 3. **VT emulation**: Feeds output through a VT100 emulator to track the virtual screen state
 4. **Differential rendering**: Compares current screen to previous and emits only the changes
 5. **History tracking**: Maintains a buffer of output for lookback mode since the last full redraw
-6. **Signal forwarding**: Window resize (SIGWINCH), interrupt (SIGINT), and terminate (SIGTERM) signals are forwarded to Claude
+6. **Signal forwarding**: Window resize, interrupt, and terminate signals are forwarded to Claude (SIGWINCH/SIGINT/SIGTERM on Unix, console events on Windows)
 
 ## Installation with Nix
 
