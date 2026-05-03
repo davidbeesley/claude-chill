@@ -27,4 +27,8 @@ pub struct Cli {
     /// Auto-lookback timeout in ms, 0 to disable (default: 15000)
     #[arg(short = 'a', long = "auto-lookback-timeout")]
     pub auto_lookback_timeout: Option<u64>,
+
+    /// Use the terminal cursor instead of Claude's virtual cursor
+    #[arg(long = "use-terminal-cursor")]
+    pub use_terminal_cursor: bool,
 }

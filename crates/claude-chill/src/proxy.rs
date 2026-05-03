@@ -8,7 +8,7 @@ use crate::history_filter::HistoryFilter;
 use crate::line_buffer::LineBuffer;
 use anyhow::{Context, Result};
 use log::debug;
-use memchr::memmem;
+use memchr::{memchr, memmem};
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -16,12 +16,14 @@ use nix::pty::{Winsize, openpty};
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, sigaction};
 use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use nix::unistd::{Pid, isatty, read, write};
+use std::borrow::Cow;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use termwiz::cell::unicode_column_width;
 use termwiz::escape::Action;
 use termwiz::escape::csi::{CSI, Keyboard};
 use termwiz::escape::parser::Parser as TermwizParser;
@@ -55,6 +57,7 @@ pub struct ProxyConfig {
     pub lookback_sequence_legacy: Vec<u8>,
     pub lookback_sequence_kitty: Vec<u8>,
     pub auto_lookback_timeout_ms: u64,
+    pub use_terminal_cursor: bool,
 }
 
 impl Default for ProxyConfig {
@@ -65,9 +68,84 @@ impl Default for ProxyConfig {
             lookback_sequence_legacy: vec![0x1E],
             lookback_sequence_kitty: b"\x1b[54;5u".to_vec(),
             auto_lookback_timeout_ms: 15000,
+            use_terminal_cursor: false,
         }
     }
 }
+
+#[derive(Debug, Default)]
+struct CursorFilter {
+    pending: Vec<u8>,
+    enabled: bool,
+}
+
+impl CursorFilter {
+    fn new(enabled: bool) -> Self {
+        Self {
+            pending: Vec::new(),
+            enabled,
+        }
+    }
+
+    fn filter<'a>(&mut self, data: &'a [u8]) -> Cow<'a, [u8]> {
+        if self.pending.is_empty() && memchr(0x1B, data).is_none() {
+            return Cow::Borrowed(data);
+        }
+
+        let mut output = Vec::with_capacity(data.len());
+
+        for &byte in data {
+            if self.pending.is_empty() {
+                if byte == 0x1B {
+                    self.pending.push(byte);
+                } else {
+                    output.push(byte);
+                }
+                continue;
+            }
+
+            self.pending.push(byte);
+
+            if self.enabled && is_cursor_hide(&self.pending) {
+                self.pending.clear();
+                continue;
+            }
+
+            if self.enabled && is_fake_cursor(&self.pending) {
+                output.extend_from_slice(fake_cursor_inner(&self.pending));
+                self.pending.clear();
+                continue;
+            }
+
+            if is_incomplete_csi(&self.pending)
+                || (self.enabled && is_cursor_hide_prefix(&self.pending))
+                || (self.enabled && is_fake_cursor_prefix(&self.pending))
+            {
+                continue;
+            }
+
+            if byte == 0x1B {
+                output.extend_from_slice(&self.pending[..self.pending.len() - 1]);
+                self.pending.clear();
+                self.pending.push(byte);
+                continue;
+            }
+
+            output.extend_from_slice(&self.pending);
+            self.pending.clear();
+        }
+
+        Cow::Owned(output)
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+// Observed Claude Code fake cursor sequences are about 15 bytes long, for
+// example: ESC[7m SPACE CR ESC[1B ESC[27m.
+const MAX_PENDING_FAKE_CURSOR_LEN: usize = 32;
 
 struct TerminalGuard {
     original_termios: Option<Termios>,
@@ -133,6 +211,7 @@ pub struct Proxy {
     paste_end_finder: memmem::Finder<'static>,
     pty_drain_buffer: Vec<u8>,
     paste_remainder: Vec<u8>,
+    cursor_filter: CursorFilter,
 }
 
 /// Returns (supported, initial_flags) - if flags > 0, terminal is already in Kitty mode
@@ -278,6 +357,7 @@ impl Proxy {
         history.push_bytes(CURSOR_HOME);
 
         let auto_lookback_timeout = Duration::from_millis(config.auto_lookback_timeout_ms);
+        let cursor_filter = CursorFilter::new(config.use_terminal_cursor);
 
         debug!("Proxy::spawn: command={} args={:?}", command, args);
 
@@ -319,6 +399,7 @@ impl Proxy {
             paste_end_finder: memmem::Finder::new(BRACKETED_PASTE_END),
             pty_drain_buffer: Vec::new(),
             paste_remainder: Vec::new(),
+            cursor_filter,
         })
     }
 
@@ -399,6 +480,13 @@ impl Proxy {
         }
 
         // Final render before exit
+        if self.config.use_terminal_cursor {
+            let data = self.cursor_filter.finish();
+            if !data.is_empty() {
+                self.process_output_inner(&data, &stdout_fd, true)?;
+            }
+        }
+
         if self.vt_render_pending {
             self.render_vt_screen(&stdout_fd)?;
         }
@@ -407,7 +495,12 @@ impl Proxy {
     }
 
     fn process_output<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
-        self.process_output_inner(data, stdout_fd, true)
+        if self.config.use_terminal_cursor {
+            let data = self.cursor_filter.filter(data);
+            self.process_output_inner(&data, stdout_fd, true)
+        } else {
+            self.process_output_inner(data, stdout_fd, true)
+        }
     }
 
     fn process_output_inner<F: AsFd>(
@@ -1230,6 +1323,91 @@ fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
     read(fd.as_fd(), buf)
 }
 
+fn is_incomplete_csi(data: &[u8]) -> bool {
+    let Some(param_start) = csi_param_start(data) else {
+        return false;
+    };
+
+    !data[param_start..]
+        .iter()
+        .any(|b| (0x40..=0x7E).contains(b))
+}
+
+fn csi_param_start(data: &[u8]) -> Option<usize> {
+    if data.starts_with(b"\x1b[") {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+fn is_cursor_hide(data: &[u8]) -> bool {
+    data == b"\x1b[?25l"
+}
+
+fn is_cursor_hide_prefix(data: &[u8]) -> bool {
+    b"\x1b[?25l".starts_with(data)
+}
+
+fn is_fake_cursor(data: &[u8]) -> bool {
+    data.starts_with(b"\x1b[7m")
+        && data.ends_with(b"\x1b[27m")
+        && is_fake_cursor_inner(&data[4..data.len() - 5])
+}
+
+fn is_fake_cursor_prefix(data: &[u8]) -> bool {
+    (b"\x1b[7m".starts_with(data) && data.len() < b"\x1b[7m".len())
+        || (data.starts_with(b"\x1b[7m")
+            && data.len() <= MAX_PENDING_FAKE_CURSOR_LEN
+            && !data[4..].contains(&b'\n')
+            && !data.ends_with(b"\x1b[27m"))
+}
+
+fn is_fake_cursor_inner(data: &[u8]) -> bool {
+    !data.is_empty()
+        && !data.contains(&b'\n')
+        && printable_width_without_cursor_moves(data).is_some_and(|width| width <= 1)
+}
+
+fn fake_cursor_inner(data: &[u8]) -> &[u8] {
+    &data[4..data.len() - 5]
+}
+
+fn printable_width_without_cursor_moves(data: &[u8]) -> Option<usize> {
+    let mut text = String::new();
+    let mut index = 0;
+
+    while index < data.len() {
+        match data[index] {
+            b'\r' => {
+                index += 1;
+            }
+            0x1b => {
+                index = skip_csi(data, index)?;
+            }
+            0x00..=0x1f | 0x7f => return None,
+            _ => {
+                let rest = std::str::from_utf8(&data[index..]).ok()?;
+                let ch = rest.chars().next()?;
+                text.push(ch);
+                index += ch.len_utf8();
+            }
+        }
+    }
+
+    Some(unicode_column_width(&text, None))
+}
+
+fn skip_csi(data: &[u8], index: usize) -> Option<usize> {
+    let rest = data.get(index..)?;
+    let param_start = csi_param_start(rest)?;
+    let final_index = rest[param_start..]
+        .iter()
+        .position(|b| (0x40..=0x7E).contains(b))?;
+
+    Some(index + param_start + final_index + 1)
+}
+
 fn split_trailing_marker_prefix<'a>(data: &'a [u8], marker: &[u8]) -> (&'a [u8], &'a [u8]) {
     let max_prefix = marker.len().saturating_sub(1).min(data.len());
     for prefix_len in (1..=max_prefix).rev() {
@@ -1401,6 +1579,126 @@ mod tests {
         // 3. App pops keyboard mode on exit
         tracker.process_output(b"\x1b[<u");
         assert!(!tracker.mode_enabled());
+    }
+
+    #[test]
+    fn test_cursor_filter_removes_cursor_hide() {
+        let mut filter = CursorFilter::new(true);
+
+        assert_eq!(filter.filter(b"a\x1b[?25lb").as_ref(), b"ab");
+    }
+
+    #[test]
+    fn test_cursor_filter_removes_split_cursor_hide() {
+        let mut filter = CursorFilter::new(true);
+
+        assert_eq!(filter.filter(b"a\x1b[").as_ref(), b"a");
+        assert_eq!(filter.filter(b"?25l").as_ref(), b"");
+        assert_eq!(filter.filter(b"b").as_ref(), b"b");
+    }
+
+    #[test]
+    fn test_cursor_filter_preserves_cursor_show_when_hiding_is_suppressed() {
+        let mut filter = CursorFilter::new(true);
+
+        assert_eq!(filter.filter(b"a\x1b[?25hb").as_ref(), b"a\x1b[?25hb");
+    }
+
+    #[test]
+    fn test_cursor_filter_removes_fake_cursor_space() {
+        let mut filter = CursorFilter::new(true);
+
+        assert_eq!(filter.filter(b"a\x1b[7m \x1b[27mb").as_ref(), b"a b");
+    }
+
+    #[test]
+    fn test_cursor_filter_removes_split_fake_cursor_space() {
+        let mut filter = CursorFilter::new(true);
+
+        assert_eq!(filter.filter(b"a\x1b[7m").as_ref(), b"a");
+        assert_eq!(filter.filter(b" ").as_ref(), b"");
+        assert_eq!(filter.filter(b"\x1b[27m").as_ref(), b" ");
+        assert_eq!(filter.filter(b"b").as_ref(), b"b");
+    }
+
+    #[test]
+    fn test_cursor_filter_strips_single_cell_fake_cursor_attributes() {
+        let mut filter = CursorFilter::new(true);
+
+        assert_eq!(filter.filter(b"a\x1b[7mf\x1b[27mb").as_ref(), b"afb");
+    }
+
+    #[test]
+    fn test_cursor_filter_preserves_inverse_keycap_text() {
+        let mut filter = CursorFilter::new(true);
+
+        assert_eq!(
+            filter.filter(b"a\x1b[7mEnter\x1b[27mb").as_ref(),
+            b"a\x1b[7mEnter\x1b[27mb"
+        );
+    }
+
+    #[test]
+    fn test_cursor_filter_preserves_wide_inverse_text() {
+        let mut filter = CursorFilter::new(true);
+
+        assert_eq!(
+            filter
+                .filter("a\x1b[7m\u{3042}\x1b[27mb".as_bytes())
+                .as_ref(),
+            "a\x1b[7m\u{3042}\x1b[27mb".as_bytes()
+        );
+    }
+
+    #[test]
+    fn test_cursor_filter_removes_fake_cursor_attributes_around_cursor_moves() {
+        let mut filter = CursorFilter::new(true);
+
+        assert_eq!(
+            filter.filter(b"a\x1b[7mf\x1b[6C\x1b[27m b").as_ref(),
+            b"af\x1b[6C b"
+        );
+    }
+
+    #[test]
+    fn test_cursor_filter_removes_fake_cursor_attributes_across_carriage_return() {
+        let mut filter = CursorFilter::new(true);
+
+        assert_eq!(
+            filter.filter(b"a\x1b[7m \r\x1b[1B\x1b[27mb").as_ref(),
+            b"a \r\x1b[1Bb"
+        );
+    }
+
+    #[test]
+    fn test_cursor_filter_preserves_multiline_inverse_text() {
+        let mut filter = CursorFilter::new(true);
+
+        assert_eq!(
+            filter.filter(b"a\x1b[7mline1\r\nline2\x1b[27mb").as_ref(),
+            b"a\x1b[7mline1\r\nline2\x1b[27mb"
+        );
+    }
+
+    #[test]
+    fn test_cursor_filter_preserves_long_inverse_text() {
+        let mut filter = CursorFilter::new(true);
+
+        assert_eq!(
+            filter
+                .filter(b"a\x1b[7m012345678901234567890123456789012\x1b[27mb")
+                .as_ref(),
+            b"a\x1b[7m012345678901234567890123456789012\x1b[27mb"
+        );
+    }
+
+    #[test]
+    fn test_cursor_filter_finish_flushes_pending_sequence() {
+        let mut filter = CursorFilter::new(true);
+
+        assert_eq!(filter.filter(b"a\x1b[7m").as_ref(), b"a");
+        assert_eq!(filter.finish(), b"\x1b[7m");
+        assert_eq!(filter.filter(b"b").as_ref(), b"b");
     }
 
     // Tests for sequence matching (used for lookback key detection)

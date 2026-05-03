@@ -63,6 +63,8 @@ Options:
           Key to toggle lookback mode, quote to prevent glob expansion (default: "[ctrl][6]")
   -a, --auto-lookback-timeout <AUTO_LOOKBACK_TIMEOUT>
           Auto-lookback timeout in ms, 0 to disable (default: 15000)
+      --use-terminal-cursor
+          Use the terminal cursor instead of Claude's virtual cursor
   -h, --help
           Print help
   -V, --version
@@ -86,6 +88,9 @@ claude-chill -k "[f12]" claude
 
 # Disable auto-lookback (see below)
 claude-chill -a 0 claude
+
+# Use the terminal cursor instead of Claude's virtual cursor
+claude-chill --use-terminal-cursor claude
 
 # Combine options with claude arguments
 claude-chill -H 50000 -a 0 -- claude --verbose
@@ -121,6 +126,7 @@ history_lines = 100000           # Max lines stored for lookback
 lookback_key = "[ctrl][6]"       # Key to toggle lookback mode
 refresh_rate = 20                # Rendering FPS
 auto_lookback_timeout_ms = 15000 # Auto-lookback after 15s idle (0 to disable)
+use_terminal_cursor = false      # Use the terminal cursor instead of Claude's virtual cursor
 ```
 
 Note: History is cleared on full screen redraws, so lookback shows output since Claude's last full render.

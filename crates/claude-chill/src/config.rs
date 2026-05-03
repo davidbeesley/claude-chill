@@ -14,6 +14,7 @@ pub struct Config {
     pub lookback_key: String,
     pub refresh_rate: u64,
     pub auto_lookback_timeout_ms: u64,
+    pub use_terminal_cursor: bool,
 }
 
 impl Default for Config {
@@ -23,6 +24,7 @@ impl Default for Config {
             lookback_key: DEFAULT_LOOKBACK_KEY.to_string(),
             refresh_rate: DEFAULT_REFRESH_RATE,
             auto_lookback_timeout_ms: DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS,
+            use_terminal_cursor: false,
         }
     }
 }
@@ -101,6 +103,7 @@ mod tests {
         assert_eq!(config.refresh_rate, 20);
         assert_eq!(config.redraw_throttle_ms(), 50);
         assert_eq!(config.auto_lookback_timeout_ms, 15000);
+        assert!(!config.use_terminal_cursor);
     }
 
     #[test]

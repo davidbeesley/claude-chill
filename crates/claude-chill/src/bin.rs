@@ -57,12 +57,15 @@ fn main() -> ExitCode {
         .auto_lookback_timeout
         .unwrap_or(config.auto_lookback_timeout_ms);
 
+    let use_terminal_cursor = config.use_terminal_cursor || cli.use_terminal_cursor;
+
     let proxy_config = ProxyConfig {
         max_history_lines: history_lines,
         lookback_key,
         lookback_sequence_legacy,
         lookback_sequence_kitty,
         auto_lookback_timeout_ms,
+        use_terminal_cursor,
     };
 
     let cmd_args: Vec<&str> = cli.args.iter().map(|s| s.as_str()).collect();
