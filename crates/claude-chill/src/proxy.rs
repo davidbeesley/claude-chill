@@ -94,6 +94,7 @@ impl Drop for TerminalGuard {
 
 const RENDER_DELAY_MS: u64 = 5;
 const SYNC_BLOCK_DELAY_MS: u64 = 50;
+const WRITE_STALL_POLL_MS: u16 = 100;
 
 pub struct Proxy {
     config: ProxyConfig,
@@ -1185,7 +1186,24 @@ fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
     while written < data.len() {
         match write(fd, &data[written..]) {
             Ok(n) => written += n,
-            Err(Errno::EAGAIN) | Err(Errno::EINTR) => continue,
+            Err(Errno::EINTR) => continue,
+            Err(Errno::EAGAIN) => {
+                // The far end stopped draining. Retrying the write immediately
+                // spins a full core for as long as the stall lasts, so wait for
+                // writability instead.
+                let mut poll_fds = [PollFd::new(fd.as_fd(), PollFlags::POLLOUT)];
+                match poll(&mut poll_fds, PollTimeout::from(WRITE_STALL_POLL_MS)) {
+                    Ok(_) | Err(Errno::EINTR) => {}
+                    Err(e) => anyhow::bail!("poll for writability failed: {}", e),
+                }
+                // run() checks the signal flags only at the top of its loop, so
+                // without this a stalled write leaves the process ignoring SIGTERM
+                // for as long as the far end stays blocked. SIGINT is deliberately
+                // not checked: run() forwards it to the child and keeps going.
+                if SIGTERM_RECEIVED.load(Ordering::SeqCst) {
+                    anyhow::bail!("SIGTERM received while blocked writing to a stalled terminal");
+                }
+            }
             Err(e) => anyhow::bail!("write failed: {}", e),
         }
     }
@@ -1571,5 +1589,39 @@ mod tests {
         let (forward, remainder) = split_trailing_marker_prefix(data, marker);
         assert!(forward.is_empty());
         assert_eq!(remainder, b"\x1b[2");
+    }
+
+    #[test]
+    fn test_write_all_gives_up_when_the_far_end_stalls() {
+        // Once the far end stops draining, write() returns EAGAIN for as long as
+        // the stall lasts. Retrying it immediately pins a core and never returns
+        // to run(), so the proxy also stops forwarding input and stops acting on
+        // SIGTERM - the session is wedged until it is killed with SIGKILL.
+        use nix::unistd::pipe;
+
+        let (reader, writer) = pipe().expect("pipe");
+        set_nonblocking(&writer).expect("set_nonblocking");
+
+        // Fill the pipe buffer. Nothing ever reads `reader`.
+        let filler = vec![b'x'; 1 << 20];
+        while write(&writer, &filler).is_ok() {}
+
+        SIGTERM_RECEIVED.store(true, Ordering::SeqCst);
+        let start = Instant::now();
+        let result = write_all(&writer, b"blocked");
+        let elapsed = start.elapsed();
+        SIGTERM_RECEIVED.store(false, Ordering::SeqCst);
+
+        assert!(
+            result.is_err(),
+            "a write against a stalled reader must give up, not block forever"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a stalled write must wait for writability, not spin (took {:?})",
+            elapsed
+        );
+
+        drop(reader);
     }
 }
