@@ -106,9 +106,7 @@ After `auto_lookback_timeout_ms` (default 15 seconds) of idle (no user input), t
 
 ## Configuration
 
-Config file location:
-- **Linux**: `~/.config/claude-chill.toml`
-- **macOS**: `~/Library/Application Support/claude-chill.toml`
+Config file location: `~/.config/claude-chill.toml` (or `$XDG_CONFIG_HOME/claude-chill.toml` if set), on every platform including macOS.
 
 ```toml
 history_lines = 100000           # Max lines stored for lookback

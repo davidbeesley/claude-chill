@@ -37,7 +37,16 @@ impl Config {
     }
 
     pub fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("claude-chill.toml"))
+        Self::config_dir().map(|d| d.join("claude-chill.toml"))
+    }
+
+    /// XDG-style config dir on every platform, including macOS (not
+    /// `~/Library/Application Support`, which `dirs::config_dir()` returns there).
+    fn config_dir() -> Option<PathBuf> {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(xdg));
+        }
+        dirs::home_dir().map(|h| h.join(".config"))
     }
 
     fn load_from_file(path: &PathBuf) -> Self {
@@ -107,5 +116,18 @@ mod tests {
     fn test_default_lookback_sequence() {
         let config = Config::default();
         assert_eq!(config.lookback_sequence(), vec![0x1E]);
+    }
+
+    #[test]
+    fn test_config_path_respects_xdg_config_home() {
+        // SAFETY: single-threaded within this test; no other test reads this var.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-config-test");
+        }
+        let path = Config::config_path().unwrap();
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        assert_eq!(path, PathBuf::from("/tmp/xdg-config-test/claude-chill.toml"));
     }
 }
